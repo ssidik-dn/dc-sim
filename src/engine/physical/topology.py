@@ -16,6 +16,7 @@ Gb/s; use gbps_to_GBps() at the boundary rather than dividing by 8 inline.
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple
@@ -31,6 +32,15 @@ class LinkClass(Enum):
     SCALE_UP = "scale_up"      # GPU <-> GPU over the memory-semantic fabric
     EGRESS = "egress"          # GPU -> NIC; shared, the narrow step off-machine
     SCALE_OUT = "scale_out"    # NIC <-> switch <-> switch
+
+
+class FabricMode(Enum):
+    """How a flow's bytes are routed when more than one equal-cost path
+    exists between its endpoints. See `Fabric.route()` and
+    `Fabric.spray_routes()`."""
+    SINGLE_PATH = "single_path"        # one path for everyone; today's path()
+    PER_FLOW_ECMP = "per_flow_ecmp"    # one path per flow, hash-selected
+    SPRAYED = "sprayed"                # every equal-cost path at once
 
 
 # ---------------------------------------------------------------- endpoints
@@ -197,6 +207,103 @@ class Fabric:
                     return list(reversed(out))
                 q.append(lk.dst)
         raise ValueError(f"no path from {a} to {b} in fabric {self.name!r}")
+
+    def equal_cost_paths(self, a: GpuId, b: GpuId) -> List[List[Link]]:
+        """Every minimum-hop path from a to b, not just the first BFS finds.
+
+        "Equal-cost" means equal hop count: this model has never costed a
+        path by link capacity (`path()` doesn't either), and this doesn't
+        start now. Returns `[[]]` for a == b, matching `path()`'s "no links"
+        convention for the trivial case. Path order is sorted by link id, so
+        it is deterministic for a fixed fabric regardless of insertion or
+        traversal order -- routing decisions built on top of this (`route()`,
+        `spray_routes()`) depend on that determinism.
+        """
+        if a == b:
+            return [[]]
+
+        from collections import deque
+        dist: Dict[Node, int] = {a: 0}
+        preds: Dict[Node, List[Link]] = {}
+        q = deque([a])
+        while q:
+            cur = q.popleft()
+            nd = dist[cur] + 1
+            for lk in self.neighbours(cur):
+                if lk.dst not in dist:
+                    dist[lk.dst] = nd
+                    preds[lk.dst] = [lk]
+                    q.append(lk.dst)
+                elif dist[lk.dst] == nd:
+                    preds[lk.dst].append(lk)
+
+        if b not in dist:
+            raise ValueError(f"no path from {a} to {b} in fabric {self.name!r}")
+
+        paths: List[List[Link]] = []
+
+        def backtrack(node: Node, acc: List[Link]) -> None:
+            if node == a:
+                paths.append(list(reversed(acc)))
+                return
+            for lk in preds[node]:
+                acc.append(lk)
+                backtrack(lk.src, acc)
+                acc.pop()
+
+        backtrack(b, [])
+        paths.sort(key=lambda p: tuple(lk.id for lk in p))
+        return paths
+
+    def route(self, mode: FabricMode, flow_key: str, a: GpuId, b: GpuId) -> List[Link]:
+        """The path one flow should use to get from a to b under `mode`.
+
+        This chooses a route; it does not execute one. Nothing here submits
+        to a flow model or knows about bytes or completion time.
+        """
+        if mode is FabricMode.SINGLE_PATH:
+            return self.path(a, b)
+
+        if mode is FabricMode.PER_FLOW_ECMP:
+            paths = self.equal_cost_paths(a, b)
+            if len(paths) == 1:
+                return paths[0]
+            # hashlib, not hash(): builtin str hashing is salted per process
+            # (PYTHONHASHSEED), so the same flow could pick a different path
+            # on every run. This must be reproducible the way placement is
+            # for a given seed.
+            digest = hashlib.sha256(f"{flow_key}|{a}|{b}".encode()).digest()
+            idx = int.from_bytes(digest, "big") % len(paths)
+            return paths[idx]
+
+        if mode is FabricMode.SPRAYED:
+            raise NotImplementedError(
+                "SPRAYED mode has no single path by definition -- call "
+                "spray_routes() for the path+fraction split instead. "
+                "Executing a spread flow (one Transfer as several concurrent "
+                "partial flows with a combined completion) needs changes to "
+                "FlowNetwork's submit/completion semantics that this task "
+                "does not make; see the task 04 report.")
+
+        raise ValueError(f"unknown fabric mode: {mode!r}")
+
+    def spray_routes(self, a: GpuId, b: GpuId) -> List[Tuple[List[Link], float]]:
+        """Every equal-cost path from a to b, paired with the fraction of a
+        flow's bytes it would carry under SPRAYED semantics.
+
+        Even split (1/N across N equal-cost paths): every fabric built by
+        this project so far gives same-hop-count paths equal capacity, so
+        there is no basis yet for weighting them unevenly. This is a stated
+        assumption, not a derived one -- nothing downstream currently
+        consumes this to notice if it were wrong. See the task 04 report.
+
+        Routing decision only: this does not execute anything. Turning it
+        into an actual spread transfer is out of scope here -- see
+        `route()`'s SPRAYED branch and the task 04 report.
+        """
+        paths = self.equal_cost_paths(a, b)
+        fraction = 1.0 / len(paths)
+        return [(p, fraction) for p in paths]
 
     def link_set(self, pairs: Iterable[Tuple[GpuId, GpuId]]) -> Dict[str, Link]:
         """Every distinct link touched by a set of GPU-to-GPU flows. This is
