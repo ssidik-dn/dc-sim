@@ -20,14 +20,43 @@ shared by every predictor that needs it.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from engine.logical.deployment import Deployment
 from engine.physical.topology import Fabric
+from engine.placement.binding import BindingPolicy, BindingState
 from engine.placement.placement import Placement
 
 from .cc_backend.comm_groups import CommGroupRegistry
+
+
+@dataclass
+class BindingConfig:
+    """How to resolve a transfer to one specific replica when its target
+    pool has more than one -- task 14. Absent (the `EngineContext.binding`
+    default, `None`) means "no policy configured", which keeps every
+    predictor's existing behaviour: raise on ambiguity rather than guess.
+
+    `timing` is the other axis task 14 asks to be modelled explicitly:
+
+    - "early" -- decide the destination replica now, with the binding
+      policy's current state, and price the real fabric path to it. The
+      decision may be stale by the time the transfer would actually land.
+    - "late" -- as Frontier itself does (task 14 spec S1: KV decides at
+      arrival, in `on_kv_cache_arrival`; M2N's target appears on a
+      bookkeeping object built after the predictor returns). No destination
+      exists yet to price a real path against, so the price is the mean
+      fabric cost over every candidate -- see the task 14 report S2 for why
+      that was chosen over pricing a single guessed destination.
+    """
+    policy: BindingPolicy
+    timing: str
+    state: BindingState = field(default_factory=BindingState)
+
+    def __post_init__(self) -> None:
+        if self.timing not in ("early", "late"):
+            raise ValueError(f"timing must be 'early' or 'late', got {self.timing!r}")
 
 
 @dataclass(frozen=True)
@@ -36,6 +65,7 @@ class EngineContext:
     placement: Placement
     deployment: Deployment
     groups: CommGroupRegistry
+    binding: Optional[BindingConfig] = None
 
 
 _context: Optional[EngineContext] = None
