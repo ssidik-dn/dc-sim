@@ -11,12 +11,21 @@ by any of this.
 """
 from __future__ import annotations
 
+import pytest
+
+from frontier.types import ClusterType
+
 from engine.logical.deployment import Deployment, PoolKind, Rank, Replica
 from engine.network.transfers import Transfer, isolated_durations
 from engine.physical.builders import build_node_scale
 from engine.physical.topology import GpuId
 from engine.placement.binding import BindingPolicy, BindingState, Candidate, bind
 from engine.placement.placement import explicit
+
+from integration.binding_support import price_transfer
+from integration.cc_backend.comm_groups import (CommGroupError, CommGroupRegistry,
+                                                 populate_from_deployment)
+from integration.context import BindingConfig, EngineContext
 
 SOURCE = Rank("SRC", 0, 0)
 
@@ -129,3 +138,66 @@ def test_ties_break_deterministically():
         chosen = bind(BindingPolicy.NEAREST, [src_rank], [candidate_a, candidate_b],
                      BindingState(), fabric=fab, placement=placement)
         assert chosen.replica_id == 3, "ties must resolve to the lower replica_id"
+
+
+# ---------------------------------------------------------- integration-level
+
+
+def _two_decode_replicas():
+    fab = build_node_scale(num_machines=1, gpus_per_machine=4)
+    d = Deployment("t")
+    d.add(Replica(PoolKind.PREFILL, 0, tp=1))
+    d.add(Replica(PoolKind.DECODE, 0, tp=1))
+    d.add(Replica(PoolKind.DECODE, 1, tp=1))
+    reg = CommGroupRegistry()
+    populate_from_deployment(reg, d, {PoolKind.PREFILL: ClusterType.PREFILL,
+                                      PoolKind.DECODE: ClusterType.DECODE})
+    placement = explicit(d, fab, {
+        d.replicas[0].ranks[0]: GpuId(0, 0),
+        d.replicas[1].ranks[0]: GpuId(0, 1),
+        d.replicas[2].ranks[0]: GpuId(0, 2),
+    })
+    return fab, d, reg, placement
+
+
+def test_no_policy_still_raises():
+    """The guard from task 09/11 must survive task 14: with no BindingConfig
+    set (EngineContext.binding defaults to None), an ambiguous destination
+    pool still raises rather than picking one -- refusing beats guessing,
+    unchanged."""
+    fab, d, reg, placement = _two_decode_replicas()
+    ctx = EngineContext(fab, placement, d, reg)  # binding=None
+    with pytest.raises(CommGroupError):
+        price_transfer(ctx, ClusterType.PREFILL, ClusterType.DECODE, 1 << 20, key="t")
+
+
+def test_single_replica_unchanged():
+    """The guard that matters most (task 14 spec S4): every measurement in
+    this project so far used one replica per pool. Configuring a binding
+    policy must not change a single-replica result at all -- resolve_pool
+    succeeds directly and price_transfer never reaches bind()."""
+    fab = build_node_scale(num_machines=2, gpus_per_machine=8)
+    d = Deployment("t")
+    d.add(Replica(PoolKind.PREFILL, 0, tp=1))
+    d.add(Replica(PoolKind.DECODE, 0, tp=1))
+    reg = CommGroupRegistry()
+    populate_from_deployment(reg, d, {PoolKind.PREFILL: ClusterType.PREFILL,
+                                      PoolKind.DECODE: ClusterType.DECODE})
+    placement = explicit(d, fab, {
+        d.replicas[0].ranks[0]: GpuId(0, 0),
+        d.replicas[1].ranks[0]: GpuId(1, 0),
+    })
+    size = 1 << 20
+
+    ctx_unconfigured = EngineContext(fab, placement, d, reg)
+    price_without, chosen_without = price_transfer(
+        ctx_unconfigured, ClusterType.PREFILL, ClusterType.DECODE, size, key="t")
+
+    ctx_with_policy = EngineContext(
+        fab, placement, d, reg,
+        binding=BindingConfig(BindingPolicy.ROUND_ROBIN, timing="early"))
+    price_with, chosen_with = price_transfer(
+        ctx_with_policy, ClusterType.PREFILL, ClusterType.DECODE, size, key="t")
+
+    assert price_without == price_with
+    assert chosen_without is None and chosen_with is None
