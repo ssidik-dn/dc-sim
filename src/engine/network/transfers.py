@@ -63,7 +63,7 @@ def _links_for(fabric: Fabric, t: "Transfer", mode: FabricMode) -> List[str]:
             "completion semantics, not to routing.")
     if mode is FabricMode.SINGLE_PATH:
         return [lk.id for lk in fabric.path(t.src, t.dst)]
-    return [lk.id for lk in fabric.route(t.src, t.dst, t.key, mode)]
+    return [lk.id for lk in fabric.route(mode, t.key, t.src, t.dst)]
 
 
 def run_transfers(fabric: Fabric, transfers: Sequence[Transfer],
