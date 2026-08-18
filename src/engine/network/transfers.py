@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from ..physical.topology import Fabric, GpuId, LinkClass
+from ..physical.topology import Fabric, FabricMode, GpuId, LinkClass
 from .model import Completion, FlowNetwork
 
 
@@ -35,13 +35,41 @@ def network_for(fabric: Fabric, verify: bool = True) -> FlowNetwork:
                        verify=verify)
 
 
+def _links_for(fabric: Fabric, t: "Transfer", mode: FabricMode) -> List[str]:
+    """Which links this transfer traverses, under the given routing mode.
+
+    The ECMP hash keys on the TRANSFER KEY, not on the endpoint pair. That is
+    deliberate and it models real hardware: switch ECMP hashes the flow 5-tuple,
+    so two TCP connections between the same pair of hosts carry different source
+    ports, hash differently, and take different paths. Keying on (src, dst)
+    instead would pin every transfer between a GPU pair to one path and
+    reproduce the very concentration this exists to remove.
+    """
+    if mode is FabricMode.SPRAYED:
+        raise NotImplementedError(
+            "SPRAYED routing needs multi-leg flows in FlowNetwork: a sprayed "
+            "transfer completes when its slowest leg does, so Completion would "
+            "carry several bottlenecks rather than one. That is a change to "
+            "completion semantics, not to routing.")
+    if mode is FabricMode.SINGLE_PATH:
+        return [lk.id for lk in fabric.path(t.src, t.dst)]
+    return [lk.id for lk in fabric.route(t.src, t.dst, t.key, mode)]
+
+
 def run_transfers(fabric: Fabric, transfers: Sequence[Transfer],
-                  verify: bool = True) -> List[Completion]:
+                  verify: bool = True,
+                  mode: FabricMode = FabricMode.SINGLE_PATH) -> List[Completion]:
     """Admit each transfer at its submit time and run until all complete.
 
     Transfers are admitted in submit-time order, and each admission reallocates
     bandwidth -- which revises the predicted completion of everything already
     in flight that shares a link with the newcomer.
+
+    `mode` selects routing. SINGLE_PATH is the default so that every existing
+    result is unchanged; it takes whichever path breadth-first search finds
+    first, which on a fabric with equal-cost paths concentrates every flow onto
+    the same one. PER_FLOW_ECMP disperses them, which is what a real fabric with
+    several spines does and what makes added spine capacity visible at all.
     """
     net = network_for(fabric, verify=verify)
     ordered = sorted(transfers, key=lambda t: (t.submit_ns, t.key))
@@ -51,8 +79,8 @@ def run_transfers(fabric: Fabric, transfers: Sequence[Transfer],
         # completions must be collected, not discarded -- dropping them loses
         # every transfer that finishes before the last one is admitted.
         done.extend(net.advance_to(t.submit_ns))
-        links = [lk.id for lk in fabric.path(t.src, t.dst)]
-        net.submit(t.key, links, t.size_bytes, at_ns=t.submit_ns)
+        net.submit(t.key, _links_for(fabric, t, mode), t.size_bytes,
+                   at_ns=t.submit_ns)
     done.extend(net.run_to_idle())
     return sorted(done, key=lambda c: (c.completion_ns, c.key))
 
@@ -73,9 +101,10 @@ class ContentionReport:
 
 
 def analyse(fabric: Fabric, transfers: Sequence[Transfer],
-            verify: bool = True) -> ContentionReport:
+            verify: bool = True,
+            mode: FabricMode = FabricMode.SINGLE_PATH) -> ContentionReport:
     """Run the transfers and summarise where the time went."""
-    done = run_transfers(fabric, transfers, verify=verify)
+    done = run_transfers(fabric, transfers, verify=verify, mode=mode)
     per = {c.key: c.duration_ns for c in done}
     bn = {c.key: c.bottleneck for c in done}
 
@@ -92,15 +121,20 @@ def analyse(fabric: Fabric, transfers: Sequence[Transfer],
     return ContentionReport(done, makespan, per, bn, by_class)
 
 
-def isolated_durations(fabric: Fabric,
-                       transfers: Sequence[Transfer]) -> Dict[str, int]:
+def isolated_durations(fabric: Fabric, transfers: Sequence[Transfer],
+                       mode: FabricMode = FabricMode.SINGLE_PATH
+                       ) -> Dict[str, int]:
     """Each transfer run alone, for comparison. Same model, one flow at a
-    time -- so any difference is contention and nothing else."""
+    time -- so any difference is contention and nothing else.
+
+    Takes the same mode as the contended run, so a slowdown ratio compares
+    like with like. Using different modes for the two would attribute a routing
+    difference to contention.
+    """
     out: Dict[str, int] = {}
     for t in transfers:
         net = network_for(fabric, verify=False)
-        links = [lk.id for lk in fabric.path(t.src, t.dst)]
-        net.submit(t.key, links, t.size_bytes, at_ns=0)
+        net.submit(t.key, _links_for(fabric, t, mode), t.size_bytes, at_ns=0)
         done = net.run_to_idle()
         out[t.key] = done[0].duration_ns if done else 0
     return out
