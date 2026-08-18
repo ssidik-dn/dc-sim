@@ -45,8 +45,7 @@ from frontier.kv_cache_transfer.kv_cache_transfer_predictor_registry import (
     KVCacheTransferPredictorRegistry)
 from frontier.types import ClusterType, KVCacheTransferType
 
-from engine.network.transfers import Transfer, isolated_durations
-
+from ..binding_support import price_transfer
 from ..context import EngineContext as EngineKVContext
 from ..context import require_context as _require_context
 from ..context import set_context
@@ -54,15 +53,6 @@ from ..context import set_context
 if TYPE_CHECKING:
     from frontier.config import ReplicaConfig
     from frontier.entities import Batch, Request
-
-_NS_PER_MS = 1_000_000.0
-
-
-def _ns_to_ms(duration_ns: float) -> float:
-    """The one conversion point between the engine's nanoseconds and
-    Frontier's milliseconds. Both sides are floats, so there is no integer
-    rounding direction to pick."""
-    return duration_ns / _NS_PER_MS
 
 
 @dataclass
@@ -99,6 +89,10 @@ class EngineKVCacheTransferPredictor(BaseKVCacheTransferPredictor):
         super().__init__(config)
         self._size_predictor = AnalyticalKVCacheTransferPredictor(
             AnalyticalKVCacheTransferConfig())
+        # Every binding this predictor has made (task 14): None where the
+        # destination pool was unambiguous, or where timing="late" declined
+        # to commit to one -- see price_transfer's own docstring.
+        self.bindings: list = []
 
     def get_transfer_time(
         self,
@@ -108,15 +102,11 @@ class EngineKVCacheTransferPredictor(BaseKVCacheTransferPredictor):
         kv_cache_size_bytes: int,
     ) -> float:
         ctx = _require_context()
-        src_ranks = ctx.groups.resolve_pool(source_cluster_type)
-        dst_ranks = ctx.groups.resolve_pool(target_cluster_type)
-        src_gpu = ctx.placement.gpu(src_ranks[0])
-        dst_gpu = ctx.placement.gpu(dst_ranks[0])
-
-        t = Transfer(key="kv_transfer", src=src_gpu, dst=dst_gpu,
-                    size_bytes=kv_cache_size_bytes)
-        duration_ns = isolated_durations(ctx.fabric, [t])[t.key]
-        return _ns_to_ms(duration_ns)
+        price_ms, chosen_replica_id = price_transfer(
+            ctx, source_cluster_type, target_cluster_type,
+            kv_cache_size_bytes, key="kv_transfer")
+        self.bindings.append(chosen_replica_id)
+        return price_ms
 
     def get_kv_cache_size(self, batch: "Batch", replica_config: "ReplicaConfig") -> int:
         return self._size_predictor.get_kv_cache_size(batch, replica_config)

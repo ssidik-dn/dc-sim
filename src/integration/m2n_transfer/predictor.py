@@ -38,22 +38,12 @@ from frontier.m2n_transfer.m2n_transfer_predictor_registry import (
     M2NTransferPredictorRegistry)
 from frontier.types import ClusterType, M2NTransferType
 
-from engine.network.transfers import Transfer, isolated_durations
-
+from ..binding_support import price_transfer
 from ..context import require_context
 
 if TYPE_CHECKING:
     from frontier.config import ReplicaConfig
     from frontier.entities import Batch, Request
-
-_NS_PER_MS = 1_000_000.0
-
-
-def _ns_to_ms(duration_ns: float) -> float:
-    """The one conversion point between the engine's nanoseconds and
-    Frontier's milliseconds. Both sides are floats, so there is no integer
-    rounding direction to pick."""
-    return duration_ns / _NS_PER_MS
 
 
 @dataclass(frozen=True)
@@ -114,6 +104,10 @@ class EngineM2NTransferPredictor(BaseM2NTransferPredictor):
         self.calls: int = 0
         self.total_wall_ns: int = 0
         self.last_attribution: Optional[LayerAttribution] = None
+        # Every binding this predictor has made (task 14) -- see
+        # EngineKVCacheTransferPredictor.bindings / price_transfer's own
+        # docstring for what None means here.
+        self.bindings: list = []
 
     @staticmethod
     def _current_layer_id(batch: "Batch") -> Optional[int]:
@@ -136,11 +130,6 @@ class EngineM2NTransferPredictor(BaseM2NTransferPredictor):
         wall_start = time.perf_counter_ns()
 
         ctx = require_context()
-        src_ranks = ctx.groups.resolve_pool(source_cluster_type)
-        dst_ranks = ctx.groups.resolve_pool(target_cluster_type)
-        src_gpu = ctx.placement.gpu(src_ranks[0])
-        dst_gpu = ctx.placement.gpu(dst_ranks[0])
-
         self.last_attribution = LayerAttribution(
             layer_id=self._current_layer_id(batch),
             afd_stage_idx=getattr(batch, "afd_stage_idx", None),
@@ -148,10 +137,10 @@ class EngineM2NTransferPredictor(BaseM2NTransferPredictor):
                             else "ffn_to_attn"),
         )
 
-        t = Transfer(key="m2n_transfer", src=src_gpu, dst=dst_gpu,
-                    size_bytes=activation_size_bytes)
-        duration_ns = isolated_durations(ctx.fabric, [t])[t.key]
-        result = _ns_to_ms(duration_ns)
+        result, chosen_replica_id = price_transfer(
+            ctx, source_cluster_type, target_cluster_type,
+            activation_size_bytes, key="m2n_transfer")
+        self.bindings.append(chosen_replica_id)
 
         self.calls += 1
         self.total_wall_ns += time.perf_counter_ns() - wall_start
