@@ -13,9 +13,9 @@ failure mode the task spec is shaped to avoid.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 
-from engine.logical.deployment import Rank
+from engine.logical.deployment import Deployment, ParallelKind, PoolKind, Rank
 
 GroupKey = Tuple[Any, Any, int]
 
@@ -60,3 +60,19 @@ class CommGroupRegistry:
                 f"no placement registered for cluster_type={cluster_type!r}, "
                 f"comm_domain={comm_domain!r}, num_devices={num_devices}; "
                 f"refusing to guess a packed placement") from None
+
+
+def populate_from_deployment(registry: CommGroupRegistry, deployment: Deployment,
+                             pool_cluster_type: Mapping[PoolKind, Any]) -> None:
+    """Register every TP/PP/DP/EP group of every replica in `deployment`.
+
+    `pool_cluster_type` supplies the frontier.types.ClusterType each PoolKind
+    maps to -- this module does not import Frontier, so the caller (which does,
+    and lives in src/integration/) provides the mapping rather than this
+    function guessing it.
+    """
+    for replica in deployment.replicas:
+        cluster_type = pool_cluster_type[replica.pool]
+        for kind in ParallelKind:
+            for group in replica.groups(kind):
+                registry.register(cluster_type, kind.value, group.size, group.ranks)

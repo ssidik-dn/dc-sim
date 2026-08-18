@@ -12,9 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from engine.logical.deployment import Rank
+from engine.logical.deployment import (Deployment, ParallelKind, PoolKind,
+                                       Rank, Replica)
 
-from integration.cc_backend.comm_groups import CommGroupError, CommGroupRegistry
+from integration.cc_backend.comm_groups import (CommGroupError,
+                                                 CommGroupRegistry,
+                                                 populate_from_deployment)
 
 # ---------------------------------------------------------------- registry
 
@@ -47,3 +50,13 @@ def test_registry_register_raises_on_conflicting_ranks_for_same_triple():
     with pytest.raises(CommGroupError):
         reg.register("cluster-a", "TP", 2,
                      [Rank("DECODE_ATTN", 1, 0), Rank("DECODE_ATTN", 1, 1)])
+
+
+def test_populate_from_deployment_registers_the_tp_group():
+    d = Deployment("t")
+    d.add(Replica(PoolKind.DECODE_ATTN, 0, tp=2))
+    reg = CommGroupRegistry()
+    populate_from_deployment(reg, d, {PoolKind.DECODE_ATTN: "decode-attn-cluster"})
+
+    group = d.replicas[0].groups(ParallelKind.TP)[0]
+    assert reg.resolve("decode-attn-cluster", "TP", 2) == group.ranks
