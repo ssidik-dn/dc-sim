@@ -7,11 +7,15 @@ test.
 """
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
 
 from frontier.cc_backend.backends.analytical_cc_backend import AnalyticalCCBackend
 from frontier.cc_backend.base_cc_backend import BaseCCBackend
 from frontier.cc_backend.cc_backend_config import AnalyticalCCBackendConfig
+from frontier.cc_backend.cc_backend_factory import CCBackendFactory
 from frontier.types import ClusterType
 
 from engine.cost.astra_backend import MockBackend
@@ -25,6 +29,9 @@ from integration.cc_backend.comm_groups import (CommGroupError,
                                                  CommGroupRegistry,
                                                  populate_from_deployment)
 from integration.cc_backend.engine_backend import EngineCCBackend, _ns_to_ms
+from integration.install.cc_backend import BACKEND_NAME, install
+
+ENGINE_ROOT = Path(__file__).resolve().parents[1] / "src" / "engine"
 
 # ---------------------------------------------------------------- registry
 
@@ -205,3 +212,30 @@ def test_unresolvable_comm_group_raises():
     with pytest.raises(CommGroupError):
         be.predict_allreduce(1 << 20, 8, cluster_type=ClusterType.PREFILL,
                              comm_domain="TP")  # never registered
+
+
+def test_registration_is_idempotent():
+    install()
+    install()
+    assert CCBackendFactory.get_class(BACKEND_NAME) is EngineCCBackend
+
+
+def test_engine_has_no_frontier_import():
+    """Programmatic assertion, not just the CI script (tools/check_import_direction.py)."""
+    forbidden = ("integration", "frontier", "astra_sim", "upstream")
+    violations = []
+    for path in sorted(ENGINE_ROOT.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                if node.level and node.level > 0:
+                    continue
+                names = [node.module] if node.module else []
+            else:
+                continue
+            for mod in names:
+                if mod.split(".")[0] in forbidden:
+                    violations.append((path, mod))
+    assert violations == []
