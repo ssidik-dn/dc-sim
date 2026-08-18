@@ -9,14 +9,15 @@ per-concern install steps:
   reaches it through Frontier's own CLI/config layer (task 06 finding), so it
   is only ever constructed directly, with a `Fabric`/`Placement`/`CostBackend`
   passed straight into its constructor by whoever builds it.
-- `kv_transfer.predictor.set_context()` -- makes the `Fabric`, `Placement`,
-  `Deployment`, and `CommGroupRegistry` reachable from
-  `EngineKVCacheTransferPredictor.get_transfer_time()`, which Frontier *does*
-  construct itself (task 07 finding: the KV path is genuinely selectable),
-  and which therefore cannot be handed these objects as constructor
-  arguments -- see the task 09 report for why a module-level context, set
-  here, was chosen over the alternatives (an InfraGraph file path passed as a
-  CLI flag; teaching the config class to serialise the fabric).
+- `context.set_context()` -- makes the `Fabric`, `Placement`, `Deployment`,
+  and `CommGroupRegistry` reachable from every predictor Frontier *does*
+  construct itself (KV cache transfer, task 09; M2N transfer, task 11 --
+  both selectable, per tasks 07/08's findings), and which therefore cannot be
+  handed these objects as constructor arguments. See the task 09 report for
+  why a module-level context, set here, was chosen over the alternatives (an
+  InfraGraph file path passed as a CLI flag; teaching a config class to
+  serialise the fabric) -- and task 11's report for why that context is
+  shared by every such predictor rather than one per predictor type.
 """
 from __future__ import annotations
 
@@ -25,8 +26,9 @@ from engine.physical.topology import Fabric
 from engine.placement.placement import Placement
 
 from ..cc_backend.comm_groups import CommGroupRegistry
+from ..context import EngineContext
+from ..context import set_context as _set_context
 from . import cc_backend as _cc_backend
-from ..kv_transfer.predictor import EngineKVContext, set_context as _set_kv_context
 
 
 def install(fabric: Fabric, placement: Placement, deployment: Deployment,
@@ -34,4 +36,4 @@ def install(fabric: Fabric, placement: Placement, deployment: Deployment,
     """Register every engine-backed Frontier extension, and make the engine
     state they need reachable. Safe to call more than once."""
     _cc_backend.install()
-    _set_kv_context(EngineKVContext(fabric, placement, deployment, groups))
+    _set_context(EngineContext(fabric, placement, deployment, groups))

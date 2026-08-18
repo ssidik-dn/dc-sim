@@ -23,11 +23,17 @@ producing an error that reads exactly like a closed extension point. Both
 classes are registered at import time, mirroring how Frontier's own backends
 self-register (e.g. frontier/cc_backend/backends/analytical_cc_backend.py's
 last line).
+
+The fabric/placement/deployment context this predictor needs now lives in
+`..context` (task 11 folded it in there so the M2N predictor could share it
+rather than inventing a second mechanism). `EngineKVContext` and
+`set_context` are re-exported here unchanged, so nothing that already
+imports them from this module needs to change.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from frontier.config.kv_cache_transfer_config import (AnalyticalKVCacheTransferConfig,
                                                        BaseKVCacheTransferConfig)
@@ -39,12 +45,11 @@ from frontier.kv_cache_transfer.kv_cache_transfer_predictor_registry import (
     KVCacheTransferPredictorRegistry)
 from frontier.types import ClusterType, KVCacheTransferType
 
-from engine.logical.deployment import Deployment
 from engine.network.transfers import Transfer, isolated_durations
-from engine.physical.topology import Fabric
-from engine.placement.placement import Placement
 
-from ..cc_backend.comm_groups import CommGroupRegistry
+from ..context import EngineContext as EngineKVContext
+from ..context import require_context as _require_context
+from ..context import set_context
 
 if TYPE_CHECKING:
     from frontier.config import ReplicaConfig
@@ -58,34 +63,6 @@ def _ns_to_ms(duration_ns: float) -> float:
     Frontier's milliseconds. Both sides are floats, so there is no integer
     rounding direction to pick."""
     return duration_ns / _NS_PER_MS
-
-
-@dataclass(frozen=True)
-class EngineKVContext:
-    """The engine state Frontier's config system cannot carry -- see the
-    task 09 report for why a module-level context (set by `install()` before
-    a run starts) was chosen over the alternatives."""
-    fabric: Fabric
-    placement: Placement
-    deployment: Deployment
-    groups: CommGroupRegistry
-
-
-_context: Optional[EngineKVContext] = None
-
-
-def set_context(context: EngineKVContext) -> None:
-    global _context
-    _context = context
-
-
-def _require_context() -> EngineKVContext:
-    if _context is None:
-        raise RuntimeError(
-            "EngineKVCacheTransferPredictor was called before install() set "
-            "the engine context (fabric/placement/deployment/groups). Call "
-            "integration.install.install(...) before running Frontier.")
-    return _context
 
 
 @dataclass
