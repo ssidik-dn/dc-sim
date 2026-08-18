@@ -27,10 +27,20 @@ class CommGroupError(KeyError):
 
 class CommGroupRegistry:
     """Maps a Frontier (cluster_type, comm_domain, num_devices) triple to the
-    engine ranks it refers to."""
+    engine ranks it refers to.
+
+    A second, coarser resolution mode lives alongside it: `register_pool` /
+    `resolve_pool` answer "which ranks make up the one replica of this
+    pool", for Frontier calls (KV cache transfer, M2N transfer) that carry
+    only a cluster_type -- no comm_domain, no num_devices to key a triple
+    lookup on. See task 09 spec S2.2: with more than one replica per pool,
+    nothing in the call tells us which one is meant, so this raises rather
+    than choosing.
+    """
 
     def __init__(self) -> None:
         self._groups: Dict[GroupKey, List[Rank]] = {}
+        self._pools: Dict[Any, List[List[Rank]]] = {}
 
     def register(self, cluster_type: Any, comm_domain: Any, num_devices: int,
                  ranks: List[Rank]) -> None:
@@ -61,6 +71,34 @@ class CommGroupRegistry:
                 f"comm_domain={comm_domain!r}, num_devices={num_devices}; "
                 f"refusing to guess a packed placement") from None
 
+    def register_pool(self, cluster_type: Any, ranks: List[Rank]) -> None:
+        """Record one replica's full rank set for `cluster_type`'s pool.
+
+        Called once per replica. A second call for the same cluster_type
+        records a second replica -- `resolve_pool` is what turns that into
+        a raise, not this method, since registering two replicas is not
+        itself an error until something asks to resolve one.
+        """
+        self._pools.setdefault(cluster_type, []).append(list(ranks))
+
+    def resolve_pool(self, cluster_type: Any) -> List[Rank]:
+        """The ranks of the single replica registered for this pool.
+
+        Raises if zero replicas are registered (unresolvable) or more than
+        one (binding a cross-pool request to a specific replica among
+        several is unimplemented -- see task 09 spec S2.2).
+        """
+        replicas = self._pools.get(cluster_type, [])
+        if not replicas:
+            raise CommGroupError(
+                f"no replica registered for pool cluster_type={cluster_type!r}")
+        if len(replicas) > 1:
+            raise CommGroupError(
+                f"{len(replicas)} replicas registered for pool "
+                f"cluster_type={cluster_type!r}; binding a cross-pool "
+                f"transfer to one specific replica is unimplemented")
+        return list(replicas[0])
+
 
 def populate_from_deployment(registry: CommGroupRegistry, deployment: Deployment,
                              pool_cluster_type: Mapping[PoolKind, Any]) -> None:
@@ -73,6 +111,7 @@ def populate_from_deployment(registry: CommGroupRegistry, deployment: Deployment
     """
     for replica in deployment.replicas:
         cluster_type = pool_cluster_type[replica.pool]
+        registry.register_pool(cluster_type, replica.ranks)
         for kind in ParallelKind:
             for group in replica.groups(kind):
                 registry.register(cluster_type, kind.value, group.size, group.ranks)

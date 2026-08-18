@@ -76,6 +76,36 @@ def test_populate_from_deployment_registers_the_tp_group():
     assert reg.resolve("decode-attn-cluster", "TP", 2) == group.ranks
 
 
+def test_pool_resolves_the_single_registered_replica():
+    reg = CommGroupRegistry()
+    ranks = [Rank("PREFILL", 0, 0), Rank("PREFILL", 0, 1)]
+    reg.register_pool("prefill-cluster", ranks)
+    assert reg.resolve_pool("prefill-cluster") == ranks
+
+
+def test_pool_raises_when_never_registered():
+    reg = CommGroupRegistry()
+    with pytest.raises(CommGroupError):
+        reg.resolve_pool("nonexistent-cluster")
+
+
+def test_pool_raises_on_a_second_replica():
+    reg = CommGroupRegistry()
+    reg.register_pool("decode-cluster", [Rank("DECODE", 0, 0)])
+    reg.register_pool("decode-cluster", [Rank("DECODE", 1, 0)])
+    with pytest.raises(CommGroupError, match="binding"):
+        reg.resolve_pool("decode-cluster")
+
+
+def test_populate_from_deployment_registers_the_pool_too():
+    d = Deployment("t")
+    d.add(Replica(PoolKind.DECODE_ATTN, 0, tp=2))
+    reg = CommGroupRegistry()
+    populate_from_deployment(reg, d, {PoolKind.DECODE_ATTN: "decode-attn-cluster"})
+
+    assert reg.resolve_pool("decode-attn-cluster") == d.replicas[0].ranks
+
+
 # ---------------------------------------------------------------- unit conversion
 
 
