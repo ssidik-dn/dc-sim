@@ -35,6 +35,16 @@ def network_for(fabric: Fabric, verify: bool = True) -> FlowNetwork:
                        verify=verify)
 
 
+def _path_latency_ns(fabric: Fabric, links: List[str]) -> float:
+    """Sum of each hop's propagation latency along a path. `FlowNetwork`
+    only ever sees link ids (`links: Sequence[LinkKey]` in `submit()`), not
+    `Link` objects -- it has no `latency_ns` to read. This module has the
+    real `Link` objects (from `fabric.path()`/`fabric.route()`), so it
+    computes the path term here and passes it through explicitly."""
+    by_id = {lk.id: lk for lk in fabric.links}
+    return sum(by_id[lid].latency_ns for lid in links)
+
+
 def _links_for(fabric: Fabric, t: "Transfer", mode: FabricMode) -> List[str]:
     """Which links this transfer traverses, under the given routing mode.
 
@@ -79,8 +89,9 @@ def run_transfers(fabric: Fabric, transfers: Sequence[Transfer],
         # completions must be collected, not discarded -- dropping them loses
         # every transfer that finishes before the last one is admitted.
         done.extend(net.advance_to(t.submit_ns))
-        net.submit(t.key, _links_for(fabric, t, mode), t.size_bytes,
-                   at_ns=t.submit_ns)
+        links = _links_for(fabric, t, mode)
+        net.submit(t.key, links, t.size_bytes, at_ns=t.submit_ns,
+                   path_latency_ns=_path_latency_ns(fabric, links))
     done.extend(net.run_to_idle())
     return sorted(done, key=lambda c: (c.completion_ns, c.key))
 
@@ -134,7 +145,9 @@ def isolated_durations(fabric: Fabric, transfers: Sequence[Transfer],
     out: Dict[str, int] = {}
     for t in transfers:
         net = network_for(fabric, verify=False)
-        net.submit(t.key, _links_for(fabric, t, mode), t.size_bytes, at_ns=0)
+        links = _links_for(fabric, t, mode)
+        net.submit(t.key, links, t.size_bytes, at_ns=0,
+                  path_latency_ns=_path_latency_ns(fabric, links))
         done = net.run_to_idle()
         out[t.key] = done[0].duration_ns if done else 0
     return out

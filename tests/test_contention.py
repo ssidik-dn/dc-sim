@@ -284,7 +284,32 @@ def test_crossing_a_machine_costs_more_than_staying_inside():
 
 def test_gpus_sharing_a_nic_contend():
     """The egress finding made concrete: two GPUs behind one NIC interfere
-    before their traffic reaches any switch."""
+    before their traffic reaches any switch.
+
+    Task 10 note: this threshold changed from 1.5 to a hand-computed exact
+    value once the flow model started charging path latency (see
+    engine/network/model.py). Before task 10, latency was zero everywhere
+    and the slowdown was exactly 2.0 (pure bandwidth: contended rate 25 GB/s
+    is half solo's 50 GB/s). 1.5 was headroom under that 2.0, not a
+    physical requirement.
+
+    With latency, x and y's path is 4 hops -- egress(2000ns) + scale_out
+    (5000ns) + scale_out(5000ns) + egress(2000ns) = 14000ns -- identical for
+    both, and unaffected by contention. Only the scale_out hop out of the
+    shared NIC (NIC0->leaf0) is shared; every other hop on each path is
+    exclusive to that flow.
+
+        solo:      bandwidth 400_000/50 = 8000ns  + 14000ns latency = 22000ns
+        contended: bandwidth 400_000/25 = 16000ns + 14000ns latency = 30000ns
+        slowdown = 30000/22000 = 15/11 ~= 1.3636
+
+    Latency is identical in both terms, so it dampens the ratio well below
+    the bandwidth-only 2.0 -- that is not a defect, it is what a fabric
+    whose hops are dominated by fixed per-hop delay actually does. The
+    original ">1.5" line is not one of those two numbers; asserting the
+    exact closed-form value is more honest than picking a new threshold
+    that merely happens to pass.
+    """
     fab = _fab()
     a, b = GpuId(0, 0), GpuId(0, 4)          # 8 GPUs over 4 NICs, round-robin
     assert fab.nic_of(a) == fab.nic_of(b), "fixture must put these on one NIC"
@@ -293,8 +318,10 @@ def test_gpus_sharing_a_nic_contend():
     rep = analyse(fab, [Transfer("x", a, GpuId(1, 0), 400_000),
                         Transfer("y", b, GpuId(1, 1), 400_000)])
     assert rep.per_transfer_ns["x"] > solo, "sharing a NIC must slow both"
-    assert all(s > 1.5 for s in rep.slowdown_vs(
-        {"x": solo, "y": solo}).values())
+    assert solo == 22000
+    assert rep.per_transfer_ns["x"] == 30000
+    for s in rep.slowdown_vs({"x": solo, "y": solo}).values():
+        assert s == pytest.approx(15 / 11)
 
 
 def test_gpus_on_different_nics_interfere_less():
