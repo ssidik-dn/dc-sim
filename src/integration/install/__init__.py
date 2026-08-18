@@ -18,6 +18,19 @@ per-concern install steps:
   InfraGraph file path passed as a CLI flag; teaching a config class to
   serialise the fabric) -- and task 11's report for why that context is
   shared by every such predictor rather than one per predictor type.
+
+Importing `kv_transfer.predictor` and `m2n_transfer.predictor` below is not
+decorative: each defines its `Engine*Config` class at module level and
+registers its predictor at import time (task 07's weak-reference finding --
+see those modules' docstrings), but neither happens until the module is
+actually imported. Task 09's own report noted `install()` reaching
+`kv_transfer.predictor` only as a side effect of importing `EngineKVContext`
+from it; task 11's context consolidation (moving that class to `.context`)
+quietly removed that side effect and broke discovery of both predictors'
+config classes until this was caught by running the real end-to-end tools
+rather than only the unit tests, which import the predictor modules
+directly and never hit the gap. Both imports are now explicit, for exactly
+that reason.
 """
 from __future__ import annotations
 
@@ -29,6 +42,8 @@ from ..cc_backend.comm_groups import CommGroupRegistry
 from ..context import EngineContext
 from ..context import set_context as _set_context
 from . import cc_backend as _cc_backend
+from ..kv_transfer import predictor as _kv_transfer_predictor  # noqa: F401  (see docstring)
+from ..m2n_transfer import predictor as _m2n_transfer_predictor  # noqa: F401  (see docstring)
 
 
 def install(fabric: Fabric, placement: Placement, deployment: Deployment,
