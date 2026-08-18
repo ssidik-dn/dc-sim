@@ -77,9 +77,9 @@ def single_tier_fabric(
 
 def clos_fat_tree_fabric(
     switch_radix: int,
-    depth: int,
-    gpus_per_machine: int,
-    nics_per_machine: int,
+    depth: int = 2,
+    gpus_per_machine: int = 1,
+    nics_per_machine: int = 1,
     oversubscription: float = 1.0,
     scale_up_GBps: float = 400.0,
     scale_up_latency_ns: float = 936.25,
@@ -87,49 +87,54 @@ def clos_fat_tree_fabric(
     egress_latency_ns: float = 2000.0,
     scale_out_GBps: float = 50.0,
     scale_out_latency_ns: float = 5000.0,
-    name: str = "clos",
+    name: str = "leaf-spine",
 ) -> Fabric:
-    """A depth-2 (leaf/spine) folded Clos built from radix-`switch_radix`
-    switches, per the ASTRA-sim 3.0 paper's `ClosFatTreeFabric` blueprint.
+    """A two-tier leaf-spine fabric built from radix-`switch_radix` switches.
 
-    For depth=2 the paper gives:
+    Task 02 built this as a folded, pod-structured Clos using counts the
+    ASTRA-sim 3.0 paper gives for `depth=2`:
 
-        pods            = k
-        leaves per pod  = k/2
-        spines          = (k/2)^2
-        hosts per leaf  = k/2
-        total hosts     = k^3/4
+        pods = k, leaves/pod = k/2, spines = (k/2)^2, hosts/leaf = k/2
 
-    Those four counts are exactly the edge/core counts of a classic k-ary
-    fat tree (Al-Fares 2008) -- MINUS its middle, aggregation, tier: this
-    model has only two switch kinds, leaf and spine, so there is nothing
-    between a pod's leaves but the leaves themselves. To keep the fabric
-    fully connected (see the design note below) each leaf uplinks into a
-    "plane": leaf position i (0..k/2-1) within its pod connects one link
-    to every spine in plane i, and every spine's k ports fill up exactly --
-    one link from each of the k pods' plane-i leaf. Leaves within one pod
-    are additionally linked directly to each other, standing in for the
-    missing aggregation tier.
+    Those are the *edge and core* counts of a three-tier Al-Fares fat tree
+    with the aggregation tier removed, and removing that tier disconnects
+    the topology: a leaf has only k/2 uplinks but there are k^2/4 spines,
+    so it reaches a k/2 subset, and leaves at different pod positions land
+    on disjoint subsets. Task 02 patched the resulting gap with ad hoc
+    intra-pod leaf-to-leaf links -- a workaround for a wrong spec, not a
+    real leaf-spine design, and it let same-leaf-position traffic bypass
+    the uplinks entirely, which understates exactly the oversubscription
+    pressure this blueprint exists to model.
 
-    Design note -- not in the source spec, stated here because it changes
-    measured behaviour: without the intra-pod leaf-to-leaf links, two hosts
-    behind different leaves of the *same* pod would have no path between
-    them at all (their leaves sit in different, non-overlapping planes).
-    The paper's depth-2 counts don't by themselves supply that connectivity
-    -- a real 3-tier fat tree gets it from the aggregation switches this
-    model omits. See the task 02 report for the full reasoning.
+    This is the actual two-tier construction (no pods, no aggregation
+    tier, no leaf-to-leaf links -- a full leaf<->spine mesh instead):
+
+        leaf switch:  k ports = k/2 down to hosts + k/2 up to spines
+        spine switch: k ports = k down to leaves
+
+        spines            = k/2
+        leaves            = k
+        hosts per leaf    = k/2
+        total hosts       = k * k/2 = k^2/2
+        leaf-spine links  = leaves * spines = k^2/2      (full mesh)
+
+    Every spine's k ports are exactly filled (one per leaf); every leaf's
+    k/2 uplink ports are exactly filled (one per spine). Any two hosts are
+    at most two switch-hops apart: one hop (their shared leaf) if they sit
+    behind the same leaf, otherwise leaf -> spine -> leaf.
 
     depth=1 has no spine layer and delegates to `single_tier_fabric`,
     treating switch_radix as the host count directly (no uplinks needed, so
     every port serves a host). depth>2 raises rather than approximate a
-    three-tier Clos: a mis-wired one would produce a plausible-looking wrong
-    answer, which is the failure mode this project keeps running into.
+    three-tier fat tree: it needs a real aggregation tier and different
+    counts, not a guess at wiring one in by hand.
     """
     if depth > 2:
         raise NotImplementedError(
-            f"depth={depth} Clos fat trees are not implemented; wiring one "
-            f"by hand risks a plausible-looking wrong answer, so this "
-            f"raises instead of approximating one")
+            f"depth={depth} fat trees are not implemented; a three-tier "
+            f"topology needs an aggregation tier and different counts, and "
+            f"wiring one in by hand risks a plausible-looking wrong answer, "
+            f"so this raises instead of approximating one")
 
     if depth == 1:
         return single_tier_fabric(
@@ -148,12 +153,12 @@ def clos_fat_tree_fabric(
     k = switch_radix
     if k % 2 != 0:
         raise ValueError(
-            f"switch_radix must be even for a depth-2 Clos (got {k}); an "
-            f"odd radix makes k/2 non-integral and the standard "
+            f"switch_radix must be even for a leaf-spine fabric (got {k}); "
+            f"an odd radix makes k/2 non-integral and the standard "
             f"construction doesn't apply")
 
     half = k // 2
-    pods, leaves_per_pod, spines_per_plane, hosts_per_leaf = k, half, half, half
+    num_leaves, num_spines, hosts_per_leaf = k, half, half
 
     egress_GBps = gbps_to_GBps(nic_gbps)
 
@@ -161,39 +166,23 @@ def clos_fat_tree_fabric(
     # 4:1 the SUM of a leaf's uplinks is a quarter of the SUM of its
     # downlinks, not a quarter of one downlink. Aggregate downlink per leaf
     # is (hosts_per_leaf * nics_per_machine * scale_out_GBps), split evenly
-    # over `spines_per_plane` uplinks; since hosts_per_leaf ==
-    # spines_per_plane (both equal `half` in this construction) that count
-    # cancels, leaving this. See the task 02 report for the full derivation.
+    # over `num_spines` uplinks; since hosts_per_leaf == num_spines (both
+    # equal `half` in this construction) that count cancels, leaving this.
     uplink_GBps = (nics_per_machine * scale_out_GBps) / oversubscription
 
-    # Generous on purpose: this stands in for the missing aggregation tier
-    # and must not become an accidental bottleneck that the oversubscription
-    # tests would misattribute to the leaf-spine uplink instead.
-    intra_pod_GBps = scale_out_GBps * nics_per_machine * hosts_per_leaf
-
     fab = Fabric(name)
+    spines = [SwitchId("spine", j) for j in range(num_spines)]
     mid = 0
-    leaves_in_pod = []
-    for pod in range(pods):
-        leaves_in_pod.clear()
-        for leaf_pos in range(leaves_per_pod):
-            leaf = SwitchId("leaf", pod * leaves_per_pod + leaf_pos)
-            leaves_in_pod.append(leaf)
-            for _ in range(hosts_per_leaf):
-                _wire_machine(fab, mid, gpus_per_machine, nics_per_machine, leaf,
-                             scale_up_GBps, scale_up_latency_ns,
-                             egress_GBps, egress_latency_ns,
-                             scale_out_GBps, scale_out_latency_ns)
-                mid += 1
-            plane = leaf_pos
-            for spine_idx in range(spines_per_plane):
-                spine = SwitchId("spine", plane * spines_per_plane + spine_idx)
-                fab.add_link(Link(leaf, spine, LinkClass.SCALE_OUT,
-                                  uplink_GBps, scale_out_latency_ns))
-
-        for i, a in enumerate(leaves_in_pod):
-            for b in leaves_in_pod[i + 1:]:
-                fab.add_link(Link(a, b, LinkClass.SCALE_OUT,
-                                  intra_pod_GBps, scale_out_latency_ns))
+    for leaf_idx in range(num_leaves):
+        leaf = SwitchId("leaf", leaf_idx)
+        for _ in range(hosts_per_leaf):
+            _wire_machine(fab, mid, gpus_per_machine, nics_per_machine, leaf,
+                         scale_up_GBps, scale_up_latency_ns,
+                         egress_GBps, egress_latency_ns,
+                         scale_out_GBps, scale_out_latency_ns)
+            mid += 1
+        for spine in spines:
+            fab.add_link(Link(leaf, spine, LinkClass.SCALE_OUT,
+                              uplink_GBps, scale_out_latency_ns))
 
     return fab

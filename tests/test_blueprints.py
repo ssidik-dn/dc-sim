@@ -1,7 +1,10 @@
-"""Tests for the InfraGraph blueprints (task 02 part B).
+"""Tests for the InfraGraph blueprints (task 02 part B; Clos section
+rewritten in task 03 for the corrected two-tier leaf-spine construction).
 
 `test_oversubscription_shows_up_in_contention` is the binding test: a
 blueprint parameter that doesn't move measured cost is worse than useless.
+`test_no_leaf_to_leaf_links` is the regression guard against task 02's
+pod workaround reappearing.
 """
 from __future__ import annotations
 
@@ -12,7 +15,7 @@ from engine.infragraph.emit import to_infragraph
 from engine.infragraph.parse import from_infragraph
 from engine.network.transfers import Transfer, analyse
 from engine.physical.builders import build_node_scale
-from engine.physical.topology import GpuId, LinkClass, SwitchId
+from engine.physical.topology import GpuId, SwitchId
 
 
 def _class_counts(fabric):
@@ -29,15 +32,6 @@ def _switch_ids(fabric, tier):
             if isinstance(node, SwitchId) and node.tier == tier:
                 ids.add(node)
     return ids
-
-
-def _pod_and_leaf_pos(mid, half):
-    """Inverse of clos_fat_tree_fabric's machine-id assignment order: pods
-    outermost, then leaf position, then host -- see the blueprint."""
-    pod_size = half * half
-    pod, within_pod = divmod(mid, pod_size)
-    leaf_pos = within_pod // half
-    return pod, leaf_pos
 
 
 _COMMON_KWARGS = dict(
@@ -71,80 +65,103 @@ def test_single_tier_matches_build_node_scale():
         assert other.latency_ns == lk.latency_ns
 
 
-# --------------------------------------------------------------------- clos
+# --------------------------------------------------------------- leaf-spine
 
-@pytest.mark.parametrize("k", [4, 6, 8])
-def test_clos_host_count_matches_formula(k):
+@pytest.mark.parametrize("k", [4, 8, 16])
+def test_leaf_spine_counts_match_formula(k):
     fab = clos_fat_tree_fabric(switch_radix=k, depth=2, gpus_per_machine=2,
                                nics_per_machine=1, **_COMMON_KWARGS)
-    assert len(fab.machines) == k ** 3 // 4
-    assert len(fab.gpus) == 2 * (k ** 3 // 4)
+    half = k // 2
+    assert len(_switch_ids(fab, "spine")) == half
+    assert len(_switch_ids(fab, "leaf")) == k
+    assert len(fab.machines) == k * half
+    assert len(fab.gpus) == 2 * k * half
 
 
-@pytest.mark.parametrize("k", [4, 6, 8])
-def test_clos_switch_counts_match_formula(k):
+@pytest.mark.parametrize("k", [4, 8, 16])
+def test_every_leaf_connects_to_every_spine(k):
     fab = clos_fat_tree_fabric(switch_radix=k, depth=2, gpus_per_machine=1,
                                nics_per_machine=1, **_COMMON_KWARGS)
     half = k // 2
-    assert len(_switch_ids(fab, "leaf")) == k * half
-    assert len(_switch_ids(fab, "spine")) == half * half
+    leaf_spine_links = [
+        lk for lk in fab.links
+        if isinstance(lk.src, SwitchId) and lk.src.tier == "leaf"
+        and isinstance(lk.dst, SwitchId) and lk.dst.tier == "spine"
+    ]
+    # add_link() is bidirectional by default, so the full mesh -- k leaves x
+    # k/2 spines, one link each -- appears once per direction.
+    assert len(leaf_spine_links) == k * half
+
+    leaves = _switch_ids(fab, "leaf")
+    spines = _switch_ids(fab, "spine")
+    for leaf in leaves:
+        for spine in spines:
+            assert fab.link(leaf, spine) is not None, f"missing {leaf}->{spine}"
 
 
-def test_clos_every_host_reaches_every_other():
+def test_no_leaf_to_leaf_links():
+    """The regression guard: task 02's pod workaround added direct
+    leaf-to-leaf links to route around a disconnected topology. That
+    topology is gone, and so must these links be -- their presence would
+    let cross-leaf traffic dodge the leaf-spine uplinks the oversubscription
+    parameter is supposed to govern."""
+    fab = clos_fat_tree_fabric(switch_radix=8, depth=2, gpus_per_machine=1,
+                               nics_per_machine=1, **_COMMON_KWARGS)
+    for lk in fab.links:
+        if isinstance(lk.src, SwitchId) and isinstance(lk.dst, SwitchId):
+            assert lk.src.tier != lk.dst.tier, (
+                f"same-tier switch link found: {lk.src} -> {lk.dst}")
+
+
+def test_same_leaf_path_is_one_hop():
     k = 4
+    half = k // 2
+    fab = clos_fat_tree_fabric(switch_radix=k, depth=2, gpus_per_machine=1,
+                               nics_per_machine=1, **_COMMON_KWARGS)
+    # Machines 0 and 1 both sit behind leaf 0 (hosts_per_leaf = half = 2).
+    path = fab.path(GpuId(0, 0), GpuId(1, 0))
+    switches = [n for lk in path for n in (lk.src, lk.dst) if isinstance(n, SwitchId)]
+    assert set(switches) == {SwitchId("leaf", 0)}
+    assert not any(s.tier == "spine" for s in switches)
+
+
+def test_cross_leaf_path_traverses_a_spine():
+    """Under task 02's pod topology this failed for same-pod, different-leaf
+    pairs -- there was no aggregation tier to route through. Named
+    separately from the same-leaf case for that reason."""
+    k = 4
+    half = k // 2
+    fab = clos_fat_tree_fabric(switch_radix=k, depth=2, gpus_per_machine=1,
+                               nics_per_machine=1, **_COMMON_KWARGS)
+    path = fab.path(GpuId(0, 0), GpuId(half, 0))  # machine `half` is leaf 1's first host
+    assert any(isinstance(n, SwitchId) and n.tier == "spine"
+              for lk in path for n in (lk.src, lk.dst))
+
+
+def test_every_host_reaches_every_other():
+    k = 8
     half = k // 2
     fab = clos_fat_tree_fabric(switch_radix=k, depth=2, gpus_per_machine=1,
                                nics_per_machine=1, **_COMMON_KWARGS)
     mids = sorted(fab.machines)
-    pairs = []
-    for a in mids:
-        for b in mids:
-            if a >= b:
-                continue
-            pod_a, _ = _pod_and_leaf_pos(a, half)
-            pod_b, _ = _pod_and_leaf_pos(b, half)
-            if pod_a != pod_b:
-                pairs.append((a, b))
-    # Include both same-leaf-position and different-leaf-position cross-pod
-    # pairs -- the harder case relies on bridging through the intra-pod
-    # leaf mesh on both ends (see the blueprint's design note).
-    sample = pairs[:3] + pairs[-3:]
-    assert sample
-    for a, b in sample:
+    last = mids[-1]
+    pairs = [
+        (mids[0], mids[1]),                      # same leaf
+        (mids[0], mids[half]),                   # adjacent leaf
+        (mids[0], last),                         # furthest leaf
+    ]
+    for a, b in pairs:
         path = fab.path(GpuId(a, 0), GpuId(b, 0))
-        assert path, f"no path between machine {a} and machine {b}"
-
-
-def test_clos_cross_pod_path_traverses_spine():
-    k = 4
-    half = k // 2
-    fab = clos_fat_tree_fabric(switch_radix=k, depth=2, gpus_per_machine=1,
-                               nics_per_machine=1, **_COMMON_KWARGS)
-
-    # Two hosts in the same pod, different leaves (positions 0 and 1):
-    # direct intra-pod leaf-to-leaf link, no spine.
-    within_pod_path = fab.path(GpuId(0, 0), GpuId(half, 0))
-    assert not any(isinstance(lk.dst, SwitchId) and lk.dst.tier == "spine"
-                  for lk in within_pod_path)
-    assert not any(isinstance(lk.src, SwitchId) and lk.src.tier == "spine"
-                  for lk in within_pod_path)
-
-    # Two hosts in different pods, same leaf position: must cross a spine.
-    pod_size = half * half
-    cross_pod_path = fab.path(GpuId(0, 0), GpuId(pod_size, 0))
-    assert any((isinstance(lk.src, SwitchId) and lk.src.tier == "spine")
-              or (isinstance(lk.dst, SwitchId) and lk.dst.tier == "spine")
-              for lk in cross_pod_path)
+        assert path or a == b, f"no path between machine {a} and machine {b}"
 
 
 def test_oversubscription_reduces_uplink_capacity():
     k = 4
-    half = k // 2
     ratio = 4.0
     fab = clos_fat_tree_fabric(switch_radix=k, depth=2, gpus_per_machine=1,
                                nics_per_machine=2, oversubscription=ratio,
                                **_COMMON_KWARGS)
-    leaf = SwitchId("leaf", 0)  # pod 0, leaf position 0
+    leaf = SwitchId("leaf", 0)
     uplink_total = sum(lk.capacity_GBps for lk in fab.neighbours(leaf)
                        if isinstance(lk.dst, SwitchId) and lk.dst.tier == "spine")
     downlink_total = sum(lk.capacity_GBps for lk in fab.neighbours(leaf)
@@ -154,17 +171,16 @@ def test_oversubscription_reduces_uplink_capacity():
 
 def test_oversubscription_shows_up_in_contention():
     """The binding test. Same fabric shape at 1:1 and 4:1 oversubscription;
-    enough concurrent cross-pod transfers to saturate the leaf-spine
+    enough concurrent cross-leaf transfers to saturate the leaf-spine
     uplinks. The 4:1 fabric must show a strictly longer makespan -- if it
     didn't, `oversubscription` would be a parameter that does nothing."""
     k = 4
-    half = k // 2
-    pod_size = half * half
+    half = k // 2  # hosts_per_leaf == num_spines == half
     size_bytes = 5_000_000
 
     transfers = [
-        Transfer("a", GpuId(0, 0), GpuId(pod_size, 0), size_bytes),
-        Transfer("b", GpuId(1, 0), GpuId(pod_size + 1, 0), size_bytes),
+        Transfer("a", GpuId(0, 0), GpuId(half, 0), size_bytes),
+        Transfer("b", GpuId(1, 0), GpuId(half + 1, 0), size_bytes),
     ]
 
     fab_1to1 = clos_fat_tree_fabric(switch_radix=k, depth=2, gpus_per_machine=1,
