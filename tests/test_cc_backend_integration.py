@@ -97,6 +97,14 @@ def test_pool_raises_on_a_second_replica():
         reg.resolve_pool("decode-cluster")
 
 
+def test_pool_candidates_lists_every_registered_replica_with_its_id():
+    reg = CommGroupRegistry()
+    reg.register_pool("decode-cluster", [Rank("DECODE", 0, 0)], replica_id=7)
+    reg.register_pool("decode-cluster", [Rank("DECODE", 1, 0)], replica_id=2)
+    candidates = reg.resolve_pool_candidates("decode-cluster")
+    assert candidates == [(7, [Rank("DECODE", 0, 0)]), (2, [Rank("DECODE", 1, 0)])]
+
+
 def test_populate_from_deployment_registers_the_pool_too():
     d = Deployment("t")
     d.add(Replica(PoolKind.DECODE_ATTN, 0, tp=2))

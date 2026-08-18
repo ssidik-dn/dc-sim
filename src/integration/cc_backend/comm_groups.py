@@ -13,7 +13,7 @@ failure mode the task spec is shaped to avoid.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from engine.logical.deployment import Deployment, ParallelKind, PoolKind, Rank
 
@@ -40,7 +40,7 @@ class CommGroupRegistry:
 
     def __init__(self) -> None:
         self._groups: Dict[GroupKey, List[Rank]] = {}
-        self._pools: Dict[Any, List[List[Rank]]] = {}
+        self._pools: Dict[Any, List[Tuple[int, List[Rank]]]] = {}
 
     def register(self, cluster_type: Any, comm_domain: Any, num_devices: int,
                  ranks: List[Rank]) -> None:
@@ -71,22 +71,32 @@ class CommGroupRegistry:
                 f"comm_domain={comm_domain!r}, num_devices={num_devices}; "
                 f"refusing to guess a packed placement") from None
 
-    def register_pool(self, cluster_type: Any, ranks: List[Rank]) -> None:
+    def register_pool(self, cluster_type: Any, ranks: List[Rank],
+                      replica_id: Optional[int] = None) -> None:
         """Record one replica's full rank set for `cluster_type`'s pool.
 
         Called once per replica. A second call for the same cluster_type
         records a second replica -- `resolve_pool` is what turns that into
         a raise, not this method, since registering two replicas is not
-        itself an error until something asks to resolve one.
+        itself an error until something asks to resolve one unambiguously.
+
+        `replica_id` defaults to registration order (0, 1, 2, ...) when not
+        given, so existing callers that only ever registered one replica per
+        pool are unaffected.
         """
-        self._pools.setdefault(cluster_type, []).append(list(ranks))
+        existing = self._pools.setdefault(cluster_type, [])
+        if replica_id is None:
+            replica_id = len(existing)
+        existing.append((replica_id, list(ranks)))
 
     def resolve_pool(self, cluster_type: Any) -> List[Rank]:
         """The ranks of the single replica registered for this pool.
 
         Raises if zero replicas are registered (unresolvable) or more than
-        one (binding a cross-pool request to a specific replica among
-        several is unimplemented -- see task 09 spec S2.2).
+        one -- resolving a transfer to one specific replica among several
+        needs a binding policy (task 14), which is a decision for the
+        caller to make deliberately via `resolve_pool_candidates` plus
+        `engine.placement.binding`, not something this method guesses at.
         """
         replicas = self._pools.get(cluster_type, [])
         if not replicas:
@@ -95,9 +105,26 @@ class CommGroupRegistry:
         if len(replicas) > 1:
             raise CommGroupError(
                 f"{len(replicas)} replicas registered for pool "
-                f"cluster_type={cluster_type!r}; binding a cross-pool "
-                f"transfer to one specific replica is unimplemented")
-        return list(replicas[0])
+                f"cluster_type={cluster_type!r}; resolving to one specific "
+                f"replica needs a binding policy (see resolve_pool_candidates "
+                f"and engine.placement.binding) rather than a guess")
+        return list(replicas[0][1])
+
+    def resolve_pool_candidates(self, cluster_type: Any) -> List[Tuple[int, List[Rank]]]:
+        """Every registered replica for this pool, as (replica_id, ranks)
+        pairs -- for binding among several, when `resolve_pool` itself
+        raises because there is more than one.
+
+        Raises under the same zero-replicas condition as `resolve_pool`;
+        callers that want "raise unless exactly one" should use
+        `resolve_pool` instead, since that is a different, stricter
+        contract than "give me whatever is registered, however many."
+        """
+        replicas = self._pools.get(cluster_type, [])
+        if not replicas:
+            raise CommGroupError(
+                f"no replica registered for pool cluster_type={cluster_type!r}")
+        return [(rid, list(ranks)) for rid, ranks in replicas]
 
 
 def populate_from_deployment(registry: CommGroupRegistry, deployment: Deployment,
@@ -111,7 +138,7 @@ def populate_from_deployment(registry: CommGroupRegistry, deployment: Deployment
     """
     for replica in deployment.replicas:
         cluster_type = pool_cluster_type[replica.pool]
-        registry.register_pool(cluster_type, replica.ranks)
+        registry.register_pool(cluster_type, replica.ranks, replica_id=replica.replica_id)
         for kind in ParallelKind:
             for group in replica.groups(kind):
                 registry.register(cluster_type, kind.value, group.size, group.ranks)
