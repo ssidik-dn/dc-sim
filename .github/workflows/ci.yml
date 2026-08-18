@@ -1,0 +1,20 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install pytest
+      - name: import direction
+        run: python3 tools/check_import_direction.py
+      - name: tests
+        run: python -m pytest -q
+      - name: upstream must be unmodified
+        run: |
+          if [ -d upstream ] && [ -n "$(git status --porcelain upstream/)" ]; then
+            echo "upstream/ has local modifications"; exit 1
+          fi
