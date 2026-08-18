@@ -11,12 +11,25 @@ from typing import Dict, List
 
 from ..physical.topology import (Fabric, GpuId, Link, LinkClass, Machine,
                                  NicId, Node, ScaleUpDomain, SwitchId)
-from .validate import validate_infragraph
+from .validate import InfraGraphError, validate_infragraph
 
 
 def from_infragraph(doc: dict) -> Fabric:
     validate_infragraph(doc)
+    return _reconstruct_fabric(doc)
 
+
+def _reconstruct_fabric(doc: dict) -> Fabric:
+    """The actual reconstruction, with no validation of its own.
+
+    Kept separate from `from_infragraph()` so a test can call it directly on
+    a document that has *not* been validated -- otherwise a test that goes
+    through `from_infragraph()` can never observe the parser's own logic
+    failing, since `validate_infragraph()` runs first on every call and
+    would raise first by construction. Calling this directly is how
+    `test_validator_catches_everything_the_parser_would` finds failure
+    modes the validator doesn't yet cover.
+    """
     fab = Fabric(doc["name"])
     nodes: Dict[str, Node] = {}
     machine_gpus: Dict[int, List[GpuId]] = {}
@@ -36,7 +49,11 @@ def from_infragraph(doc: dict) -> Fabric:
             elif component == "asic":
                 node = SwitchId(instance, mid)
             else:
-                raise ValueError(f"unrecognised component in node {name!r}")
+                # validate_infragraph() should have caught this already;
+                # this is defence in depth, kept to the same exception type
+                # so callers only ever need to catch one.
+                raise InfraGraphError(
+                    f"unrecognised component in node {name!r}")
             nodes[name] = node
 
     for mid in sorted(machine_gpus.keys() | machine_nics.keys()):
@@ -53,7 +70,15 @@ def from_infragraph(doc: dict) -> Fabric:
     # here is added as a one-way link.
     for edge in doc["edges"]:
         src, dst = nodes[edge["src"]], nodes[edge["dst"]]
-        link = Link(src, dst, LinkClass(edge["link_type"]),
+        try:
+            link_class = LinkClass(edge["link_type"])
+        except ValueError as exc:
+            # Same defence-in-depth as above: validate_infragraph() rejects
+            # this first, but the parser raises the project's own exception
+            # type rather than a bare ValueError either way.
+            raise InfraGraphError(
+                f"unknown link_type: {edge['link_type']!r}") from exc
+        link = Link(src, dst, link_class,
                    edge["attrs"]["bandwidth_GBps"], edge["attrs"]["latency_ns"])
         fab.add_link(link, bidirectional=False)
         # GPU-to-NIC binding is implied by the forward egress edge only --

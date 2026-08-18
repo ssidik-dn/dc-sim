@@ -12,7 +12,7 @@ import json
 import pytest
 
 from engine.infragraph.emit import to_infragraph
-from engine.infragraph.parse import from_infragraph
+from engine.infragraph.parse import _reconstruct_fabric, from_infragraph
 from engine.infragraph.validate import InfraGraphError, validate_infragraph
 from engine.network.transfers import Transfer, analyse
 from engine.physical.builders import build_node_scale, build_rack_scale
@@ -179,6 +179,120 @@ def test_validator_rejects_missing_required_field():
 
 def test_validator_accepts_valid_document():
     validate_infragraph(_valid_doc())
+
+
+def test_validator_rejects_unknown_link_type():
+    doc = _valid_doc()
+    doc["edges"][0]["link_type"] = "nvlink"
+    with pytest.raises(InfraGraphError):
+        validate_infragraph(doc)
+
+
+def test_validator_rejects_duplicate_edge():
+    doc = _valid_doc()
+    doc["edges"].append(copy.deepcopy(doc["edges"][0]))
+    with pytest.raises(InfraGraphError):
+        validate_infragraph(doc)
+
+
+def test_isolated_component():
+    """A3: reject. Fabric has no standalone inventory for switches -- they
+    exist only as link endpoints -- so preserving an isolated one would mean
+    restructuring Fabric. Rejecting is cheap and this is very likely a
+    document error regardless (Task 01 found the switch-side instance of
+    exactly this gap)."""
+    doc = _valid_doc()
+    doc["devices"].append({
+        "instance": "machine", "index": 999,
+        "components": [{"component": "gpu", "index": 0, "attrs": {}}],
+    })
+    with pytest.raises(InfraGraphError):
+        validate_infragraph(doc)
+
+
+def test_parser_raises_infragraph_error_not_value_error():
+    """Bypasses validate_infragraph() on purpose (see _reconstruct_fabric's
+    docstring) to exercise the parser's own defence-in-depth guards."""
+    bad_link_type = _valid_doc()
+    bad_link_type["edges"][0]["link_type"] = "nvlink"
+    with pytest.raises(InfraGraphError):
+        _reconstruct_fabric(bad_link_type)
+
+    bad_component = _valid_doc()
+    bad_component["devices"][0]["components"][0]["component"] = "widget"
+    with pytest.raises(InfraGraphError):
+        _reconstruct_fabric(bad_component)
+
+
+# --------------------------------------------------- validator/parser parity
+
+def _mut_dangling_edge(d):
+    d["edges"].append({
+        "src": "machine.0.gpu.0", "dst": "machine.99.gpu.0",
+        "link_type": "scale_up", "attrs": {"bandwidth_GBps": 1.0, "latency_ns": 1.0},
+    })
+
+
+def _mut_unknown_link_type(d):
+    d["edges"][0]["link_type"] = "nvlink"
+
+
+def _mut_unrecognised_component(d):
+    d["devices"][0]["components"][0]["component"] = "widget"
+
+
+def _mut_missing_edges_field(d):
+    del d["edges"]
+
+
+def _mut_missing_devices_field(d):
+    del d["devices"]
+
+
+def _mut_edge_missing_attrs(d):
+    del d["edges"][0]["attrs"]
+
+
+# Each of these is confirmed (by the assertion inside the test below) to make
+# the raw, unvalidated parser raise. Documents that instead produce a silent
+# wrong Fabric -- duplicate node names, duplicate edges, domain disagreement,
+# non-positive bandwidth, an unknown schema_version -- are deliberately left
+# out: the parser doesn't crash on those at all, which is exactly why the
+# validator has to catch them instead. See the task 02 report.
+PARSER_BREAKING_MUTATIONS = [
+    _mut_dangling_edge,
+    _mut_unknown_link_type,
+    _mut_unrecognised_component,
+    _mut_missing_edges_field,
+    _mut_missing_devices_field,
+    _mut_edge_missing_attrs,
+]
+
+
+def test_validator_catches_everything_the_parser_would():
+    """The binding test. Uses _reconstruct_fabric(), not from_infragraph():
+    from_infragraph() calls validate_infragraph() first on every input, so
+    testing through it would make this pass by construction regardless of
+    whether the validator rules actually cover the parser's failure modes.
+    Going around that guard is what makes this a real regression check --
+    add a new way for the parser to blow up without a matching validator
+    rule, and this test catches it."""
+    for mutate in PARSER_BREAKING_MUTATIONS:
+        doc = _valid_doc()
+        mutate(doc)
+
+        parser_raised = False
+        try:
+            _reconstruct_fabric(doc)
+        except Exception:
+            parser_raised = True
+        assert parser_raised, (
+            f"{mutate.__name__} was expected to break the raw parser; it "
+            f"didn't, so it belongs in the 'silent wrong Fabric' category "
+            f"instead, not in this list")
+
+        with pytest.raises(InfraGraphError, match=".*"):
+            validate_infragraph(doc)
 
 
 # -------------------------------------------------------------- cost parity
