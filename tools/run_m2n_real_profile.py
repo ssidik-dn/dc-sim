@@ -230,9 +230,15 @@ def _run_scenario(label: str, dummy: bool, model_name: str) -> None:
     }), flush=True)
 
 
+_SCRIPT_PATH = str(Path(__file__).resolve())
+
+
 def _run_scenario_in_subprocess(label: str, dummy: bool, model_name: str) -> dict:
+    # Absolute path: the subprocess's cwd is FRONTIER_ROOT, and a relative
+    # __file__ would resolve against that instead of where this script
+    # actually lives (task 13 found this the hard way -- fixed here too).
     proc = subprocess.run(
-        [sys.executable, __file__, "--scenario", label,
+        [sys.executable, _SCRIPT_PATH, "--scenario", label,
          "--mode", "dummy" if dummy else "real", "--model", model_name],
         capture_output=True, text=True, cwd=str(FRONTIER_ROOT))
     for line in proc.stdout.splitlines():
