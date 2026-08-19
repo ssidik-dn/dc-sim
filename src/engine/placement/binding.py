@@ -101,26 +101,32 @@ def _least_loaded(candidates: Sequence[Candidate], state: BindingState) -> Candi
                                        r.replica_id))
 
 
+def distance_key(fabric: Fabric, placement: Placement, source_rank: Rank,
+                 candidate: Candidate) -> Tuple[bool, int, int]:
+    """Fewest hops from `source_rank` to `candidate`'s first rank, same-domain
+    candidates preferred outright (a same-domain hop is fewer physical links
+    even when a raw hop count could tie -- see
+    test_nearest_prefers_same_scale_up_domain for the case this exists for).
+    The third element (`candidate.replica_id`) makes the key itself a total,
+    deterministic order, so callers needing more than just the minimum (task
+    15's `TopologyAwareClusterScheduler`, which combines this with a load
+    signal `bind()` has no notion of) can sort or rank candidates by it
+    directly rather than re-deriving fabric distance a second time."""
+    source_gpu = placement.gpu(source_rank)
+    candidate_gpu = placement.gpu(candidate.ranks[0])
+    same_domain = fabric.same_domain(source_gpu, candidate_gpu)
+    hops = len(fabric.path(source_gpu, candidate_gpu))
+    return (not same_domain, hops, candidate.replica_id)
+
+
 def _nearest(source_ranks: Sequence[Rank], candidates: Sequence[Candidate],
             fabric: Fabric, placement: Placement) -> Candidate:
-    """Fewest hops from the source's first rank to the candidate's first
-    rank, same-domain candidates preferred outright (a same-domain hop is
-    fewer physical links even when a raw hop count could tie -- see
-    test_nearest_prefers_same_scale_up_domain for the case this exists for).
-    Ties broken by ascending replica_id.
-    """
+    """Nearest by `distance_key`, ties broken by ascending replica_id (folded
+    into the key itself)."""
     if not source_ranks:
         raise BindingError("nearest needs at least one source rank")
-    source_gpu = placement.gpu(source_ranks[0])
-
-    def key(candidate: Candidate) -> Tuple[bool, int, int]:
-        candidate_gpu = placement.gpu(candidate.ranks[0])
-        same_domain = fabric.same_domain(source_gpu, candidate_gpu)
-        hops = len(fabric.path(source_gpu, candidate_gpu))
-        return (not same_domain, hops, candidate.replica_id)
-
     ordered = _by_replica_id(candidates)
-    return min(ordered, key=key)
+    return min(ordered, key=lambda c: distance_key(fabric, placement, source_ranks[0], c))
 
 
 def _explicit(source_ranks: Sequence[Rank], candidates: Sequence[Candidate],
