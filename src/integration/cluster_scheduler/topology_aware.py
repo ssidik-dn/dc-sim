@@ -176,9 +176,20 @@ class TopologyAwareClusterScheduler(RoundRobinClusterScheduler):
         return loads
 
     def _decode_candidates(self) -> List[Candidate]:
-        ctx = require_context()
-        return [Candidate(rid, tuple(ranks)) for rid, ranks in
-               ctx.groups.resolve_pool_candidates(ClusterType.DECODE)]
+        """Built directly from `self._cluster.replicas.keys()` -- Frontier's
+        own, real replica ids for *this* cluster -- not this project's own
+        `CommGroupRegistry` (whose ids are per-pool, 0-indexed; Frontier's
+        are a single counter shared across every cluster type in
+        construction order, task 14 report S3). Using Frontier's own ids
+        directly means `select_replica`'s answer can be fed straight back
+        into `request_mapping`/`_dp_replica_schedulers` with no conversion,
+        and no risk of the two id spaces being silently conflated. Only the
+        *rank* (for distance lookups against this project's own
+        `Placement`) needs the offset back to a per-pool index; assumes
+        tp=1, matching every prior integration in this project."""
+        offset = min(self._cluster.replicas.keys())
+        return [Candidate(rid, (Rank(PoolKind.DECODE.value, rid - offset, 0),))
+               for rid in self._cluster.replicas.keys()]
 
     def _schedule_decode_lane_round_robin(self) -> List[Tuple[int, int, "Request"]]:
         """Overrides the dynamic per-request assignment
@@ -244,15 +255,31 @@ class TopologyAwareClusterScheduler(RoundRobinClusterScheduler):
            already guaranteed.
         """
         ctx = require_context()
-        candidates = [Candidate(rid, tuple(ranks)) for rid, ranks in
-                     ctx.groups.resolve_pool_candidates(ClusterType.DECODE_FFN)]
+        # Frontier's own ids for this (DECODE_FFN) cluster, same reasoning as
+        # _decode_candidates: `_ffn_lane_to_target_replica`'s values are read
+        # back by base_cluster_scheduler.py as real replica ids, so
+        # `Candidate.replica_id` must be one, not this project's per-pool id.
+        ffn_offset = min(self._cluster.replicas.keys())
+        candidates = [Candidate(rid, (Rank(PoolKind.DECODE_FFN.value, rid - ffn_offset, 0),))
+                     for rid in self._cluster.replicas.keys()]
         lane_count: Dict[int, int] = {c.replica_id: 0 for c in candidates}
         new_map: Dict[Tuple[int, int], int] = {}
         new_by_target: Dict[int, List[Tuple[int, int]]] = {c.replica_id: [] for c in candidates}
 
+        # Frontier's own replica ids are a single counter shared across every
+        # cluster type in construction order (frontier/entities/base_entity.py's
+        # generate_id -- the same fact task 14's report S3 had to correct
+        # for): `lane`'s first element is that global id, offset by
+        # `decode_attn_replica_id_start_for_ffn` (== prefill_cluster_num_replicas,
+        # frontier/config/config.py), not this project's own per-pool
+        # replica_id (CommGroupRegistry.register_pool's `len(existing)`).
+        # Subtracting the offset recovers the per-pool id our own Rank/
+        # Placement objects were built with.
+        attn_id_start = int(self._config.decode_attn_replica_id_start_for_ffn)
+
         def source_rank_for(lane: Tuple[int, int]) -> Rank:
             attn_replica_id, dp_id = lane
-            return Rank(PoolKind.DECODE_ATTN.value, attn_replica_id, dp_id)
+            return Rank(PoolKind.DECODE_ATTN.value, attn_replica_id - attn_id_start, dp_id)
 
         lanes = list(self._ffn_expected_lanes)
         num_replicas = len(candidates)
