@@ -127,9 +127,27 @@ class CommGroupRegistry:
         return [(rid, list(ranks)) for rid, ranks in replicas]
 
 
+# Task 20's own finding, from running it rather than assuming the generic
+# `ParallelKind.value` strings would match: Frontier's real cc_backend call
+# sites never pass `comm_domain="TP"` -- they split by which sublayer is
+# allreducing, `comm_domain="ATTN_TP"` for attention's own tensor-parallel
+# allreduce and `comm_domain="MOE_TP"` for the FFN/MoE one (grep across
+# frontier/execution_time_predictor/*.py's `comm_domain=` call sites; "PP",
+# "DP", and "EP" do match their `ParallelKind` counterpart directly, no
+# alias needed). This project's own `Replica`/`ParallelKind` model has one
+# TP degree per replica, not a separate attention-TP and MoE-TP value, so
+# the one TP group registered for a replica is physically both -- the same
+# ranks answer either name.
+_DOMAIN_ALIASES: Mapping[ParallelKind, Tuple[str, ...]] = {
+    ParallelKind.TP: ("TP", "ATTN_TP", "MOE_TP"),
+}
+
+
 def populate_from_deployment(registry: CommGroupRegistry, deployment: Deployment,
                              pool_cluster_type: Mapping[PoolKind, Any]) -> None:
-    """Register every TP/PP/DP/EP group of every replica in `deployment`.
+    """Register every TP/PP/DP/EP group of every replica in `deployment`,
+    under every domain name Frontier's own cc_backend calls actually use
+    for it (see `_DOMAIN_ALIASES`).
 
     `pool_cluster_type` supplies the frontier.types.ClusterType each PoolKind
     maps to -- this module does not import Frontier, so the caller (which does,
@@ -141,4 +159,5 @@ def populate_from_deployment(registry: CommGroupRegistry, deployment: Deployment
         registry.register_pool(cluster_type, replica.ranks, replica_id=replica.replica_id)
         for kind in ParallelKind:
             for group in replica.groups(kind):
-                registry.register(cluster_type, kind.value, group.size, group.ranks)
+                for domain in _DOMAIN_ALIASES.get(kind, (kind.value,)):
+                    registry.register(cluster_type, domain, group.size, group.ranks)
