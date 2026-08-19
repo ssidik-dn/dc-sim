@@ -41,6 +41,7 @@ from engine.physical.topology import Fabric
 from engine.placement.placement import Placement
 
 from ..cc_backend.comm_groups import CommGroupRegistry
+from ..cc_backend.collective import install_collective_backend as _install_collective_backend
 from ..context import BindingConfig, EngineContext
 from ..context import set_context as _set_context
 from . import cc_backend as _cc_backend
@@ -49,13 +50,27 @@ from ..m2n_transfer import predictor as _m2n_transfer_predictor  # noqa: F401  (
 
 
 def install(fabric: Fabric, placement: Placement, deployment: Deployment,
-           groups: CommGroupRegistry, binding: Optional[BindingConfig] = None) -> None:
+           groups: CommGroupRegistry, binding: Optional[BindingConfig] = None,
+           collective: bool = False) -> None:
     """Register every engine-backed Frontier extension, and make the engine
     state they need reachable. Safe to call more than once.
 
     `binding` (task 14) is optional and defaults to `None` -- unconfigured,
     every predictor's behaviour is exactly what it was before task 14: raise
     on a destination pool with more than one replica, rather than guess.
+
+    `collective` (task 20) is optional and defaults to `False`. `True`
+    patches `CCBackendFactory.create` (`..cc_backend.collective`, guarded
+    by a source hash) so every tensor-/pipeline-/expert-parallel collective
+    Frontier's own execution-time predictors ask for is priced by
+    `EngineCCBackend` from the fabric instead of Frontier's placement-blind
+    profiled table -- regardless of which `--cc_backend_config_type` value
+    the run's own argv used. `False` (the default) leaves
+    `CCBackendFactory.create` untouched, same as every task before this
+    one.
     """
     _cc_backend.install()
-    _set_context(EngineContext(fabric, placement, deployment, groups, binding=binding))
+    if collective:
+        _install_collective_backend()
+    _set_context(EngineContext(fabric, placement, deployment, groups, binding=binding,
+                               collective=collective))

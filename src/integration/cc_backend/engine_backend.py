@@ -1,26 +1,56 @@
 """EngineCCBackend: answer Frontier's six BaseCCBackend prediction calls with
-this project's Fabric/Placement/CostBackend model instead of Frontier's own
-closed-form ones.
+this project's Fabric/Placement cost model instead of Frontier's own
+closed-form or profiled ones.
 
-Unit conversion happens in exactly one place, `_ns_to_ms`, immediately below.
-Frontier's six `predict_*` methods return float milliseconds; this engine
-computes nanoseconds throughout (int for point-to-point transfers, float for
-CostBackend.estimate results). Both representations are floats or exact ints
-converted through a single divide-by-1e6, so there is no integer rounding
-direction to choose -- see `test_ns_to_ms_is_exact_for_whole_microseconds` in
-tests/test_cc_backend_integration.py for the round-trip check.
+Task 06 built this against a separate `CostBackend.estimate()` abstraction
+(ASTRA-sim or a mock), before task 10 put latency and contention into
+`engine.network.transfers`. Task 20 rewrites the five true collectives
+(`predict_send_recv` was already correct) to go through that same
+`Transfer`/`run_transfers` path every other topology-aware predictor in
+this project already uses -- so a collective and a point-to-point transfer
+over the same links now agree by construction, per task 20 spec S3.1,
+rather than needing a separate agreement test against a second model. See
+this module's own investigation (task 20 report S4) for why: a real,
+built ASTRA-sim binary was available and was tried first, and its own
+analytical collective model turned out *not* to reliably price a
+domain-split tensor-parallel group as more expensive than a packed one at
+realistic message sizes -- the opposite of what this task's acceptance
+criteria require and what a well-formed ring should do. Rather than depend
+on an external algorithm this project cannot fully account for, the five
+collectives below are priced from an explicitly stated, defensible
+algorithm each (ring for allreduce/allgather/reduce_scatter, full pairwise
+for all_to_all, sequential relay for broadcast), computed from the exact
+same fabric contention model (`run_transfers`) as every KV/M2N transfer.
+
+**Task 16's limitation restated, not worked around**: a collective's
+participants are resolved as a whole registered group
+(`CommGroupRegistry.resolve`), keyed by `(cluster_type, comm_domain,
+num_devices)` -- there is no channel here, any more than there was for a
+KV/M2N transfer's sending replica, for *which* rank issued *this specific*
+call when more than one group could answer to the same triple (multiple
+replicas of the same pool, each with its own same-shaped TP group). Every
+call that resolves to the same triple is therefore priced identically,
+against whichever one group was registered for it; `CommGroupRegistry`
+raises rather than silently disambiguating if a second, differently-placed
+group is ever registered under the same triple (see `register`'s own
+conflict check) -- refusing beats guessing, the same rule as everywhere
+else in this project.
+
+Unit conversion happens in exactly one place, `_ns_to_ms`, immediately
+below. Frontier's six `predict_*` methods return float milliseconds; this
+engine computes nanoseconds throughout (int for point-to-point transfers),
+converted through a single divide-by-1e6.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Sequence, Tuple
 
 from frontier.cc_backend.base_cc_backend import BaseCCBackend
 from frontier.cc_backend.cc_backend_config import BaseCCBackendConfig
 from frontier.types import ClusterType
 
-from engine.cost.astra_backend import CostBackend
-from engine.logical.deployment import ParallelGroup, ParallelKind
-from engine.network.transfers import Transfer, isolated_durations
+from engine.logical.deployment import Rank
+from engine.network.transfers import Transfer, run_transfers
 from engine.physical.topology import Fabric
 from engine.placement.placement import Placement
 
@@ -41,19 +71,19 @@ class EngineCCBackend(BaseCCBackend):
     Construction needs both what Frontier supplies (config, cluster_type,
     device_type, network_device, num_devices -- required by
     `BaseCCBackend.__init__`) and what only this project has: a `Fabric`, a
-    `Placement`, a `CostBackend` to price collectives, and a
-    `CommGroupRegistry` to turn Frontier's (cluster_type, comm_domain,
-    num_devices) triple into the rank set that triple actually means. See
-    task 06 spec S7 for why the two constructor shapes cannot be reconciled
-    through Frontier's own CCBackendFactory.create() without an upstream
-    change.
+    `Placement` to price collectives against, and a `CommGroupRegistry` to
+    turn Frontier's (cluster_type, comm_domain, num_devices) triple into
+    the rank set that triple actually means. See task 06 spec S7 for why
+    the two constructor shapes cannot be reconciled through Frontier's own
+    `CCBackendFactory.create()` without an upstream change, and task 20's
+    report for how it is reached anyway (a guarded runtime replacement of
+    `create()` itself, not a CLI flag).
     """
 
     def __init__(
         self,
         fabric: Fabric,
         placement: Placement,
-        cost_backend: CostBackend,
         groups: CommGroupRegistry,
         *,
         config: Optional[BaseCCBackendConfig] = None,
@@ -67,55 +97,143 @@ class EngineCCBackend(BaseCCBackend):
             cluster_type, device_type, network_device, num_devices)
         self._fabric = fabric
         self._placement = placement
-        self._cost_backend = cost_backend
         self._groups = groups
 
-    # -- shared path for the five true collectives --------------------------
-    def _collective_ms(self, op: str, data_size_bytes: int, num_devices: int,
-                       cluster_type: Optional[ClusterType],
-                       comm_domain: Optional[str]) -> float:
-        self._validate_data_size(data_size_bytes)
-        self._validate_num_devices(num_devices, op)
-        ranks = self._groups.resolve(cluster_type, comm_domain, num_devices)
-        # `kind` is unused by group_shape()/induced_links() -- ParallelGroup
-        # is reused here purely as the (kind, ranks) container Placement
-        # already knows how to read a shape out of.
-        group = ParallelGroup(kind=ParallelKind.TP, ranks=ranks)
-        shape = self._placement.group_shape(group)
-        result = self._cost_backend.estimate(op, data_size_bytes, shape, self._fabric)
-        return _ns_to_ms(result.duration_ns)
+    # -- shared machinery -----------------------------------------------
+
+    def _ring_order(self, ranks: Sequence[Rank]) -> List[Rank]:
+        """Domain-major ordering: every rank in one scale-up domain
+        contiguous before the next domain's. A ring visiting ranks in this
+        order crosses a domain boundary exactly once per domain-to-domain
+        transition around the cycle -- two crossings for a two-domain
+        split, the minimum any ring over a split group can achieve, and
+        the "well-formed ring" this project's own measurements (task 19)
+        and this task's own report reason about. Ties within a domain
+        break on the rank's own tuple ordering, for determinism -- never
+        dict/set iteration order.
+        """
+        return sorted(ranks, key=lambda r: (
+            self._fabric.domain_of(self._placement.gpu(r)) or 0, r))
+
+    @staticmethod
+    def _ring_edges(ordered: Sequence[Rank]) -> List[Tuple[Rank, Rank]]:
+        n = len(ordered)
+        return [(ordered[i], ordered[(i + 1) % n]) for i in range(n)]
+
+    def _round_ns(self, edges: Sequence[Tuple[Rank, Rank]], chunk_bytes: int,
+                  key_prefix: str) -> int:
+        """One round of simultaneous point-to-point transfers, contention-
+        aware (`run_transfers`, not `isolated_durations` -- multiple edges
+        in one round can share a physical link, most importantly the one
+        crossing link a domain-split group's ring uses twice). A round's
+        duration is gated by its slowest edge, exactly like a real
+        collective's synchronous step."""
+        if chunk_bytes <= 0 or not edges:
+            return 0
+        transfers = [
+            Transfer(key=f"{key_prefix}-{i}", src=self._placement.gpu(a),
+                     dst=self._placement.gpu(b), size_bytes=chunk_bytes)
+            for i, (a, b) in enumerate(edges)
+        ]
+        completions = run_transfers(self._fabric, transfers)
+        return max(c.completion_ns for c in completions)
+
+    def _resolve_group(self, cluster_type: Optional[ClusterType],
+                       comm_domain: Optional[str], num_devices: int) -> List[Rank]:
+        return self._groups.resolve(cluster_type, comm_domain, num_devices)
+
+    # -- the five true collectives, each with a stated algorithm ----------
 
     def predict_allreduce(self, data_size_bytes: int, num_devices: int,
                           cluster_type: Optional[ClusterType] = None,
                           comm_domain: Optional[str] = None) -> float:
-        return self._collective_ms("all_reduce", data_size_bytes, num_devices,
-                                   cluster_type, comm_domain)
+        """Ring all-reduce: reduce-scatter (n-1 rounds) then all-gather
+        (n-1 rounds), 2(n-1) rounds total, each moving data_size_bytes/n --
+        the standard bandwidth-optimal ring volume (task 06's own report
+        already cited Frontier's matching `2*(n-1)/n` closed-form factor).
+        """
+        self._validate_data_size(data_size_bytes)
+        self._validate_num_devices(num_devices, "allreduce")
+        ranks = self._resolve_group(cluster_type, comm_domain, num_devices)
+        if num_devices <= 1:
+            return 0.0
+        edges = self._ring_edges(self._ring_order(ranks))
+        chunk_bytes = max(1, data_size_bytes // num_devices)
+        rounds = 2 * (num_devices - 1)
+        return _ns_to_ms(rounds * self._round_ns(edges, chunk_bytes, "allreduce"))
 
     def predict_allgather(self, data_size_bytes: int, num_devices: int,
                           cluster_type: Optional[ClusterType] = None,
                           comm_domain: Optional[str] = None) -> float:
-        return self._collective_ms("all_gather", data_size_bytes, num_devices,
-                                   cluster_type, comm_domain)
-
-    def predict_broadcast(self, data_size_bytes: int, num_devices: int,
-                          cluster_type: Optional[ClusterType] = None,
-                          comm_domain: Optional[str] = None) -> float:
-        return self._collective_ms("broadcast", data_size_bytes, num_devices,
-                                   cluster_type, comm_domain)
+        """Ring all-gather: n-1 rounds, each moving data_size_bytes/n --
+        half of allreduce's ring (the all-gather phase alone)."""
+        self._validate_data_size(data_size_bytes)
+        self._validate_num_devices(num_devices, "allgather")
+        ranks = self._resolve_group(cluster_type, comm_domain, num_devices)
+        if num_devices <= 1:
+            return 0.0
+        edges = self._ring_edges(self._ring_order(ranks))
+        chunk_bytes = max(1, data_size_bytes // num_devices)
+        rounds = num_devices - 1
+        return _ns_to_ms(rounds * self._round_ns(edges, chunk_bytes, "allgather"))
 
     def predict_reduce_scatter(self, data_size_bytes: int, num_devices: int,
                                cluster_type: Optional[ClusterType] = None,
                                comm_domain: Optional[str] = None) -> float:
-        return self._collective_ms("reduce_scatter", data_size_bytes,
-                                   num_devices, cluster_type, comm_domain)
+        """Ring reduce-scatter: n-1 rounds, each moving data_size_bytes/n --
+        the mirror of all-gather; same round count and per-round volume,
+        so the same cost."""
+        self._validate_data_size(data_size_bytes)
+        self._validate_num_devices(num_devices, "reduce_scatter")
+        ranks = self._resolve_group(cluster_type, comm_domain, num_devices)
+        if num_devices <= 1:
+            return 0.0
+        edges = self._ring_edges(self._ring_order(ranks))
+        chunk_bytes = max(1, data_size_bytes // num_devices)
+        rounds = num_devices - 1
+        return _ns_to_ms(rounds * self._round_ns(edges, chunk_bytes, "reduce_scatter"))
 
     def predict_all_to_all(self, data_size_bytes: int, num_devices: int,
                            cluster_type: Optional[ClusterType] = None,
                            comm_domain: Optional[str] = None) -> float:
-        return self._collective_ms("all_to_all", data_size_bytes, num_devices,
-                                   cluster_type, comm_domain)
+        """Full pairwise exchange, one round: every ordered pair of
+        participants exchanges data_size_bytes/n simultaneously. Unlike a
+        ring, this genuinely does cross a domain boundary once for every
+        cross-domain *pair* -- 16 crossing edges for a 4-and-4 split of 8,
+        not 2 -- because expert dispatch is not a ring: every rank has
+        distinct data for every other rank, so there is no shortcut through
+        an intermediate hop the way a reduction's associativity allows.
+        """
+        self._validate_data_size(data_size_bytes)
+        self._validate_num_devices(num_devices, "all_to_all")
+        ranks = self._resolve_group(cluster_type, comm_domain, num_devices)
+        if num_devices <= 1:
+            return 0.0
+        chunk_bytes = max(1, data_size_bytes // num_devices)
+        edges = [(a, b) for a in ranks for b in ranks if a != b]
+        return _ns_to_ms(self._round_ns(edges, chunk_bytes, "all_to_all"))
 
-    # -- point-to-point -------------------------------------------------
+    def predict_broadcast(self, data_size_bytes: int, num_devices: int,
+                         cluster_type: Optional[ClusterType] = None,
+                         comm_domain: Optional[str] = None) -> float:
+        """Sequential ring relay: the source forwards the full payload to
+        its ring neighbour, which forwards it on, for n-1 hops -- simple
+        and defensible, not claimed optimal (a real broadcast would more
+        likely use a tree); not exercised by this task's acceptance tests,
+        which are about allreduce specifically."""
+        self._validate_data_size(data_size_bytes)
+        self._validate_num_devices(num_devices, "broadcast")
+        ranks = self._resolve_group(cluster_type, comm_domain, num_devices)
+        if num_devices <= 1:
+            return 0.0
+        ordered = self._ring_order(ranks)
+        total_ns = 0
+        for i in range(len(ordered) - 1):
+            total_ns += self._round_ns([(ordered[i], ordered[i + 1])],
+                                       data_size_bytes, f"broadcast-{i}")
+        return _ns_to_ms(total_ns)
+
+    # -- point-to-point ---------------------------------------------------
     def predict_send_recv(self, data_size_bytes: int,
                           cluster_type: Optional[ClusterType] = None,
                           comm_domain: Optional[str] = None) -> float:
@@ -126,7 +244,7 @@ class EngineCCBackend(BaseCCBackend):
         arity rather than one Frontier never gives us.
         """
         self._validate_data_size(data_size_bytes)
-        ranks = self._groups.resolve(cluster_type, comm_domain, 2)
+        ranks = self._resolve_group(cluster_type, comm_domain, 2)
         if len(ranks) != 2:
             raise ValueError(
                 f"send_recv needs exactly 2 ranks, registry returned "
@@ -135,5 +253,5 @@ class EngineCCBackend(BaseCCBackend):
         src = self._placement.gpu(ranks[0])
         dst = self._placement.gpu(ranks[1])
         t = Transfer(key="send_recv", src=src, dst=dst, size_bytes=data_size_bytes)
-        durations = isolated_durations(self._fabric, [t])
-        return _ns_to_ms(durations[t.key])
+        completions = run_transfers(self._fabric, [t])
+        return _ns_to_ms(completions[0].completion_ns)

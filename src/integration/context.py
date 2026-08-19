@@ -66,6 +66,7 @@ class EngineContext:
     deployment: Deployment
     groups: CommGroupRegistry
     binding: Optional[BindingConfig] = None
+    collective: bool = False
 
 
 _context: Optional[EngineContext] = None
@@ -74,6 +75,15 @@ _context: Optional[EngineContext] = None
 def set_context(context: EngineContext) -> None:
     global _context
     _context = context
+
+
+def get_context() -> Optional[EngineContext]:
+    """Non-raising accessor -- task 20's `CCBackendFactory.create` patch
+    (`cc_backend/collective.py`) runs for *every* cc_backend construction
+    Frontier ever does, including runs that never called `install()` at
+    all, so `require_context()`'s raise would be wrong there. `None` means
+    exactly what it does everywhere else in this module: unconfigured."""
+    return _context
 
 
 def require_context() -> EngineContext:

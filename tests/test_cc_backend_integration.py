@@ -18,10 +18,9 @@ from frontier.cc_backend.cc_backend_config import AnalyticalCCBackendConfig
 from frontier.cc_backend.cc_backend_factory import CCBackendFactory
 from frontier.types import ClusterType
 
-from engine.cost.astra_backend import MockBackend
 from engine.logical.deployment import (Deployment, ParallelKind, PoolKind,
                                        Rank, Replica)
-from engine.network.transfers import Transfer, isolated_durations
+from engine.network.transfers import Transfer, run_transfers
 from engine.physical.builders import build_node_scale
 from engine.placement.placement import packed, spread
 
@@ -131,12 +130,12 @@ def test_ns_to_ms_is_exact_for_whole_microseconds():
 # ---------------------------------------------------------------- EngineCCBackend
 
 
-def _backend(fabric, deployment, placement_policy, cost_backend=None):
+def _backend(fabric, deployment, placement_policy):
     placement = placement_policy(deployment, fabric)
     reg = CommGroupRegistry()
     populate_from_deployment(reg, deployment,
                              {PoolKind.DECODE_ATTN: ClusterType.DECODE_ATTN})
-    be = EngineCCBackend(fabric, placement, cost_backend or MockBackend(), reg)
+    be = EngineCCBackend(fabric, placement, reg)
     return be, placement, reg
 
 
@@ -150,56 +149,56 @@ def test_backend_subclasses_frontier_base():
 
 
 def test_all_six_methods_return_milliseconds():
+    """Task 20 rewrote the five true collectives onto `run_transfers`
+    (task 06's original `CostBackend.estimate()` path is gone -- see
+    `engine_backend.py`'s module docstring for why); this is now a basic
+    sanity check (positive, finite milliseconds for every method) rather
+    than an exact-match check against a mock model that no longer exists.
+    The algorithm-specific claims (ring beats naive pairwise, packed beats
+    split) are tested directly in tests/test_collective_backend.py."""
     fabric = build_node_scale(num_machines=1, gpus_per_machine=8)
     d = Deployment("six")
     d.add(Replica(PoolKind.DECODE_ATTN, 0, tp=8))
-    mock = MockBackend()
-    be, placement, reg = _backend(fabric, d, packed, mock)
+    be, placement, reg = _backend(fabric, d, packed)
     size = 1 << 20
     kwargs = dict(cluster_type=ClusterType.DECODE_ATTN, comm_domain="TP")
 
     group = d.replicas[0].groups(ParallelKind.TP)[0]
-    shape = placement.group_shape(group)
 
     # send_recv gets no num_devices from Frontier (see the task report) and
     # is always resolved as a 2-rank group; register that pair explicitly.
     p2p_pair = group.ranks[:2]
     reg.register(ClusterType.DECODE_ATTN, "PP", 2, p2p_pair)
 
-    collectives = {
-        "predict_allreduce": ("all_reduce", be.predict_allreduce(size, 8, **kwargs)),
-        "predict_allgather": ("all_gather", be.predict_allgather(size, 8, **kwargs)),
-        "predict_broadcast": ("broadcast", be.predict_broadcast(size, 8, **kwargs)),
-        "predict_reduce_scatter": ("reduce_scatter",
-                                  be.predict_reduce_scatter(size, 8, **kwargs)),
-        "predict_all_to_all": ("all_to_all", be.predict_all_to_all(size, 8, **kwargs)),
-    }
-    for method, (op, ms) in collectives.items():
+    for method in ("predict_allreduce", "predict_allgather", "predict_broadcast",
+                   "predict_reduce_scatter", "predict_all_to_all"):
+        ms = getattr(be, method)(size, 8, **kwargs)
         assert isinstance(ms, float) and ms > 0, method
-        expected_ns = mock.estimate(op, size, shape, fabric).duration_ns
-        assert ms == pytest.approx(expected_ns / 1_000_000.0), method
 
     gpus = placement.gpus_for(p2p_pair)
     t = Transfer(key="send_recv", src=gpus[0], dst=gpus[1], size_bytes=size)
-    expected_p2p_ns = isolated_durations(fabric, [t])[t.key]
+    expected_p2p_ns = run_transfers(fabric, [t])[0].completion_ns
     p2p_ms = be.predict_send_recv(size, cluster_type=ClusterType.DECODE_ATTN,
                                   comm_domain="PP")
     assert isinstance(p2p_ms, float) and p2p_ms > 0
     assert p2p_ms == pytest.approx(expected_p2p_ns / 1_000_000.0)
 
 
-def test_packed_placement_matches_analytical_within_bound():
-    """The binding test. For num_devices=2, Frontier's own ring all-reduce
-    volume factor 2*(n-1)/n collapses to exactly 1, so a packed placement
-    reduces both sides to the same "latency + size/bandwidth" formula --
-    provided both are parameterised from the same physical scale-up link.
-    That makes the tolerance tight (1e-6 relative): any drift beyond float
-    rounding across the Gbps<->GBps and us<->ns<->ms conversions would mean a
-    real unit bug, not two different models disagreeing. See the task 06
-    report for what happens at num_devices > 2, where the two backends are
-    NOT expected to agree -- this engine's default MockBackend cost path
-    does not model Frontier's per-device ring-volume scaling, and widening
-    this bound to paper over that would hide a real, reportable gap.
+def test_two_device_allreduce_matches_hand_ring_formula():
+    """Task 06's original version of this test compared against Frontier's
+    own analytical closed-form and required 1e-6 agreement, reasoning that
+    at num_devices=2 the ring volume factor 2*(n-1)/n collapses to 1 so
+    both sides reduce to "latency + size/bandwidth". Task 20's ring
+    implementation is a genuine sequential ring -- 2*(n-1) = 2 discrete
+    rounds, each paying the link's fixed latency separately, not one
+    amortised latency term for the whole operation -- and that changes the
+    n=2 case too: two sequential rounds pay the link latency *twice*, so
+    this engine's own number is Frontier's closed-form plus one extra
+    latency term, not equal to it. Confirmed by running it (engine
+    exceeded frontier's number by ~26%, not float noise) rather than
+    assumed, and the discrepancy is explained exactly by that one term
+    below -- this is a real difference between a step-by-step ring and a
+    single amortised formula, not a bug in either.
     """
     scale_up_GBps = 400.0
     scale_up_latency_ns = 936.25
@@ -210,21 +209,39 @@ def test_packed_placement_matches_analytical_within_bound():
                               scale_up_latency_ns=scale_up_latency_ns)
     d = Deployment("bind")
     d.add(Replica(PoolKind.DECODE_ATTN, 0, tp=2))
-    mock = MockBackend(per_hop_ns=scale_up_latency_ns, per_byte_ns=1.0 / scale_up_GBps)
-    be, _, _ = _backend(fabric, d, packed, mock)
+    be, _, _ = _backend(fabric, d, packed)
 
     engine_ms = be.predict_allreduce(size, 2, cluster_type=ClusterType.DECODE_ATTN,
                                      comm_domain="TP")
 
+    # Hand ring formula: 2*(n-1)=2 rounds, each moving size/n=524288 bytes
+    # over the one scale-up link, each round paying that link's own
+    # latency separately (a real sequential ring's rounds are not
+    # pipelined against each other in this model).
+    rounds = 2
+    chunk_bytes = size // 2
+    round_ns = scale_up_latency_ns + chunk_bytes / scale_up_GBps
+    expected_ms = (rounds * round_ns) / 1_000_000.0
+
+    # 1e-3, not 1e-6: the fabric model works in integer nanoseconds
+    # (`Completion.completion_ns`), so each of the 2 rounds can round up by
+    # up to 1ns against this float hand formula -- a few ns against a
+    # ~4500ns total is real integer rounding, not a modelling error.
+    TOLERANCE = 1e-3
+    rel_diff = abs(engine_ms - expected_ms) / expected_ms
+    assert rel_diff <= TOLERANCE, (
+        f"engine={engine_ms}ms expected={expected_ms}ms rel_diff={rel_diff}")
+
+    # And the documented, expected divergence from Frontier's own
+    # single-latency-term closed-form: approximately one extra link
+    # latency (a loose bound -- integer-ns rounding inside the fabric
+    # model, ~2ns here, is not the point of this assertion).
     cfg = AnalyticalCCBackendConfig(network_latency_us=scale_up_latency_ns / 1000.0,
                                     intra_node_bandwidth_gbps=scale_up_GBps * 8.0)
     analytical = AnalyticalCCBackend(cfg, ClusterType.DECODE_ATTN, "h100", "nvlink", 2)
     frontier_ms = analytical.predict_allreduce(size, 2)
-
-    TOLERANCE = 1e-6
-    rel_diff = abs(engine_ms - frontier_ms) / frontier_ms
-    assert rel_diff <= TOLERANCE, (
-        f"engine={engine_ms}ms frontier={frontier_ms}ms rel_diff={rel_diff}")
+    extra_latency_ms = scale_up_latency_ns / 1_000_000.0
+    assert engine_ms == pytest.approx(frontier_ms + extra_latency_ms, rel=1e-3)
 
 
 def test_split_placement_costs_more_than_packed():
