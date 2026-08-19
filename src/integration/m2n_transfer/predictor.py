@@ -80,12 +80,15 @@ class EngineM2NTransferConfig(BaseM2NTransferConfig):
 
 
 class EngineM2NTransferPredictor(BaseM2NTransferPredictor):
-    """Prices an M2N transfer as one isolated point-to-point flow between
-    the source and destination pools' representative (first) rank, routed
-    over the real fabric graph -- the same shape as
-    `EngineKVCacheTransferPredictor` (task 09), for the same reason: with
-    exactly one replica per pool, "first rank of the pool's one replica" is
-    the only unambiguous choice (see `resolve_pool`'s raise otherwise).
+    """Prices an M2N transfer as one isolated point-to-point flow, routed
+    over the real fabric graph. With exactly one replica per pool this is
+    "first rank of the pool's one replica," the same shape as
+    `EngineKVCacheTransferPredictor` (task 09). With several replicas on a
+    pool, `price_transfer` (`..binding_support`) resolves the ambiguity --
+    for a destination via `ctx.binding` (task 14), for a source the same way
+    (task 16), refined by the recovered dp lane (`batch.decode_attn_original_dp_id`,
+    task 16 S1) wherever a pool is *not* ambiguous, rather than always
+    defaulting to its representative rank.
 
     `get_activation_size`/`get_activation_size_for_request` are delegated to
     Frontier's own `AnalyticalM2NTransferPredictor` rather than
@@ -139,7 +142,7 @@ class EngineM2NTransferPredictor(BaseM2NTransferPredictor):
 
         result, chosen_replica_id = price_transfer(
             ctx, source_cluster_type, target_cluster_type,
-            activation_size_bytes, key="m2n_transfer")
+            activation_size_bytes, key="m2n_transfer", batch=batch)
         self.bindings.append(chosen_replica_id)
 
         self.calls += 1
