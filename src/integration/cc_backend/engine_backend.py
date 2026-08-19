@@ -197,19 +197,33 @@ class EngineCCBackend(BaseCCBackend):
                            cluster_type: Optional[ClusterType] = None,
                            comm_domain: Optional[str] = None) -> float:
         """Full pairwise exchange, one round: every ordered pair of
-        participants exchanges data_size_bytes/n simultaneously. Unlike a
+        participants exchanges data_size_bytes/n^2 simultaneously. Unlike a
         ring, this genuinely does cross a domain boundary once for every
         cross-domain *pair* -- 16 crossing edges for a 4-and-4 split of 8,
         not 2 -- because expert dispatch is not a ring: every rank has
         distinct data for every other rank, so there is no shortcut through
         an intermediate hop the way a reduction's associativity allows.
+
+        Task 21's own correction to task 20: `data_size_bytes` is Frontier's
+        same global-buffer convention as `predict_allreduce`'s (confirmed
+        against the real call site,
+        `sklearn_moe_execution_time_predictor.py`'s
+        `data_size_bytes = embedding_dim * 2 * routed_tokens` -- a total
+        across the whole dispatch, not one rank's share). Each of the n
+        source ranks holds `data_size_bytes/n` of that total, and a
+        personalised all-to-all splits *that* evenly across its `n`
+        possible destinations -- `data_size_bytes/n^2` per pair, not
+        `data_size_bytes/n` (task 20's original, over-charging by a factor
+        of `n`; task 20's own report called the pair *set* correct without
+        checking the per-pair volume, which is what this task's spec asked
+        to verify and found wrong).
         """
         self._validate_data_size(data_size_bytes)
         self._validate_num_devices(num_devices, "all_to_all")
         ranks = self._resolve_group(cluster_type, comm_domain, num_devices)
         if num_devices <= 1:
             return 0.0
-        chunk_bytes = max(1, data_size_bytes // num_devices)
+        chunk_bytes = max(1, data_size_bytes // (num_devices * num_devices))
         edges = [(a, b) for a in ranks for b in ranks if a != b]
         return _ns_to_ms(self._round_ns(edges, chunk_bytes, "all_to_all"))
 
