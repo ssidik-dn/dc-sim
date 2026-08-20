@@ -54,7 +54,7 @@ import sys
 from pathlib import Path
 from statistics import mean
 
-FRONTIER_ROOT = Path("/work/Frontier")
+FRONTIER_ROOT = Path("/work/simulation/Frontier")
 
 from engine.logical.deployment import Deployment, PoolKind, Replica  # noqa: E402
 from engine.physical.builders import build_node_scale  # noqa: E402

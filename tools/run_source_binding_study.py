@@ -45,7 +45,7 @@ import sys
 from pathlib import Path
 from statistics import mean
 
-FRONTIER_ROOT = Path("/work/Frontier")
+FRONTIER_ROOT = Path("/work/simulation/Frontier")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run_topology_scheduler_study import (  # noqa: E402

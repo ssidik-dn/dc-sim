@@ -27,7 +27,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-FRONTIER_ROOT = Path("/work/Frontier")
+FRONTIER_ROOT = Path("/work/simulation/Frontier")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run_blind_spot_probe import (  # noqa: E402

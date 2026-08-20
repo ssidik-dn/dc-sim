@@ -44,7 +44,7 @@ import sys
 from pathlib import Path
 from statistics import mean
 
-FRONTIER_ROOT = Path("/work/Frontier")
+FRONTIER_ROOT = Path("/work/simulation/Frontier")
 
 OUTPUT_DIR = Path("/tmp/claude-1001/-work-dc-sim/e8e62237-6408-4b18-a2fe-76ed0916f3d0"
                   "/scratchpad/compute_balance_study_outputs")

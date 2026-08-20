@@ -39,7 +39,7 @@ import time
 from pathlib import Path
 from statistics import mean
 
-FRONTIER_ROOT = Path("/work/Frontier")
+FRONTIER_ROOT = Path("/work/simulation/Frontier")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run_m2n_integration import (  # noqa: E402
