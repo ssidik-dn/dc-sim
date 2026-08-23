@@ -261,7 +261,11 @@ def _run_scenario_in_subprocess(n_gpus: int, num_requests: int = FIXED_NUM_REQUE
 
 
 def _fit_exponent(xs: list[float], ys: list[float]) -> float:
-    """Slope of log(y) vs log(x) -- the growth exponent."""
+    """Slope of log(y) vs log(x) across the whole sweep -- a single global
+    fit. Kept for reference only: task 30's own finding is that this
+    number hides a convex curve (a global fit averages a shallow start
+    against a steep finish), and is not what should be read as "the"
+    exponent -- see `_per_doubling_exponents` below, which is."""
     import math
     lx = [math.log(x) for x in xs]
     ly = [math.log(y) for y in ys]
@@ -270,6 +274,23 @@ def _fit_exponent(xs: list[float], ys: list[float]) -> float:
     num = sum((a - mx) * (b - my) for a, b in zip(lx, ly))
     den = sum((a - mx) ** 2 for a in lx)
     return num / den if den else float("nan")
+
+
+def _per_doubling_exponents(xs: list[float], ys: list[float]) -> list[tuple[float, float, float]]:
+    """The exponent for each consecutive doubling: `log2(y[i+1]/y[i])`,
+    valid when `xs` doubles step to step (this sweep's own `FABRIC_SIZES`
+    does). This is the number that describes behaviour at scale for a
+    convex curve -- task 30's own correction to task 26's single global
+    fit, which averaged a shallow start against a steep finish and
+    reported the average as "effectively linear" when the growth at the
+    largest doubling was still ~2.5. Returns `(x_from, x_to, exponent)`
+    triples."""
+    import math
+    out = []
+    for i in range(len(xs) - 1):
+        ratio = ys[i + 1] / ys[i] if ys[i] else float("nan")
+        out.append((xs[i], xs[i + 1], math.log2(ratio) if ratio > 0 else float("nan")))
+    return out
 
 
 def _fabric_size_sweep() -> None:
@@ -291,11 +312,26 @@ def _fabric_size_sweep() -> None:
     ok = [r for r in rows if not r.get("error")]
     if len(ok) >= 2:
         xs = [r["n_gpus"] for r in ok]
-        exp_wall = _fit_exponent(xs, [r["wall_s"] for r in ok])
-        exp_links = _fit_exponent(xs, [r["n_links"] for r in ok])
-        exp_rss = _fit_exponent(xs, [r["peak_rss_kb"] for r in ok])
+        wall = [r["wall_s"] for r in ok]
+        links = [r["n_links"] for r in ok]
+        rss = [r["peak_rss_kb"] for r in ok]
+
         print()
-        print(f"fitted exponent (log-log slope): wall_s ~ n_gpus^{exp_wall:.2f}  "
+        print("=== per-doubling exponent (the one that describes behaviour at scale) ===")
+        for (x0, x1, e_wall), (_, _, e_links), (_, _, e_rss) in zip(
+                _per_doubling_exponents(xs, wall),
+                _per_doubling_exponents(xs, links),
+                _per_doubling_exponents(xs, rss)):
+            print(f"  {x0:>4} -> {x1:>4}: wall_s x{wall[xs.index(x1)]/wall[xs.index(x0)]:.2f} "
+                 f"(exp {e_wall:+.2f})  n_links exp {e_links:+.2f}  peak_rss exp {e_rss:+.2f}")
+
+        exp_wall = _fit_exponent(xs, wall)
+        exp_links = _fit_exponent(xs, links)
+        exp_rss = _fit_exponent(xs, rss)
+        print()
+        print(f"global fitted exponent (reference only -- see per-doubling above for "
+             f"the number that matters on a convex curve): "
+             f"wall_s ~ n_gpus^{exp_wall:.2f}  "
              f"n_links ~ n_gpus^{exp_links:.2f}  peak_rss ~ n_gpus^{exp_rss:.2f}")
     return rows
 

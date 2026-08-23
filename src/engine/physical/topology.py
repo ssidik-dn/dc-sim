@@ -156,6 +156,7 @@ class Fabric:
         self._gpu_nic: Dict[GpuId, NicId] = {}
         self._link_index_cache: Optional[Dict[str, Link]] = None
         self._capacity_index_cache: Optional[Dict[str, float]] = None
+        self._path_cache: Dict[Tuple[GpuId, GpuId], List[Link]] = {}
 
     # -- construction ------------------------------------------------------
     def add_machine(self, machine: Machine) -> None:
@@ -183,6 +184,7 @@ class Fabric:
         # instead of serving a stale map.
         self._link_index_cache = None
         self._capacity_index_cache = None
+        self._path_cache = {}
 
     def bind_nic(self, gpu: GpuId, nic: NicId) -> None:
         """Which NIC a GPU egresses through. This is what makes egress
@@ -252,9 +254,23 @@ class Fabric:
 
     def path(self, a: GpuId, b: GpuId) -> List[Link]:
         """Links traversed from a to b. Breadth-first over the graph, so it
-        stays correct as topologies get less regular. Returns [] for a == b."""
+        stays correct as topologies get less regular. Returns [] for a == b.
+
+        Memoised on the ordered `(a, b)` pair (task 30): for a fixed fabric
+        the path between two GPUs never changes, and the BFS itself never
+        got cheaper as fabrics grew (task 29 report, S5 -- it stayed the
+        dominant cost precisely because nothing before this task touched
+        it). Keyed on GPUs, not ranks or placement, so one cache serves
+        every placement built on the same fabric object -- confirmed by
+        this method's own signature, which takes only `GpuId`s. Same
+        immutability argument and same `add_link` invalidation as
+        `link_index()`/`capacity_index()`, reused rather than re-derived.
+        """
         if a == b:
             return []
+        cached = self._path_cache.get((a, b))
+        if cached is not None:
+            return cached
         from collections import deque
         prev: Dict[Node, Tuple[Node, Link]] = {}
         seen = {a}
@@ -273,7 +289,9 @@ class Fabric:
                         p, l = prev[n]
                         out.append(l)
                         n = p
-                    return list(reversed(out))
+                    result = list(reversed(out))
+                    self._path_cache[(a, b)] = result
+                    return result
                 q.append(lk.dst)
         raise ValueError(f"no path from {a} to {b} in fabric {self.name!r}")
 
