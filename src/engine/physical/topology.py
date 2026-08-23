@@ -50,8 +50,18 @@ class GpuId:
     machine: int
     index: int                 # index within the machine
 
+    def __post_init__(self) -> None:
+        # Cached once per instance -- these are immutable (frozen) and their
+        # string form is read millions of times (Link.id below, on every
+        # fabric-rebuild call a contention model makes). `object.__setattr__`
+        # on an unannotated name is invisible to the dataclass machinery: it
+        # does not become a field, so __eq__/__hash__/__lt__ (all generated
+        # from `machine`/`index` only) are unaffected -- this is a cache
+        # slot, not new state.
+        object.__setattr__(self, "_str", f"m{self.machine}.g{self.index}")
+
     def __str__(self) -> str:
-        return f"m{self.machine}.g{self.index}"
+        return self._str
 
 
 @dataclass(frozen=True, order=True)
@@ -59,8 +69,11 @@ class NicId:
     machine: int
     index: int
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_str", f"m{self.machine}.n{self.index}")
+
     def __str__(self) -> str:
-        return f"m{self.machine}.n{self.index}"
+        return self._str
 
 
 @dataclass(frozen=True, order=True)
@@ -68,8 +81,11 @@ class SwitchId:
     tier: str                  # "leaf" | "spine"
     index: int
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_str", f"{self.tier}{self.index}")
+
     def __str__(self) -> str:
-        return f"{self.tier}{self.index}"
+        return self._str
 
 
 Node = object  # GpuId | NicId | SwitchId
@@ -85,9 +101,15 @@ class Link:
     capacity_GBps: float
     latency_ns: float
 
-    @property
-    def id(self) -> str:
-        return f"{self.src}->{self.dst}"
+    def __post_init__(self) -> None:
+        # `id` was a `@property` re-formatting an f-string (itself calling
+        # `str()` on both endpoints) on every access -- measured at 63.5% of
+        # total wall-clock on a 512-GPU fabric (task 26 report, S2.2), since
+        # every per-call fabric rebuild touches every link. Endpoints are
+        # already cached above; this precomputes `id` itself once, as a
+        # plain instance attribute rather than a property, so `lk.id` is a
+        # direct attribute lookup with no `__get__` indirection at all.
+        object.__setattr__(self, "id", f"{self.src}->{self.dst}")
 
     def __str__(self) -> str:
         return f"{self.id} [{self.link_class.value} {self.capacity_GBps:g}GB/s]"
@@ -132,6 +154,8 @@ class Fabric:
         self._adj: Dict[Node, List[Link]] = {}
         self._gpu_domain: Dict[GpuId, int] = {}
         self._gpu_nic: Dict[GpuId, NicId] = {}
+        self._link_index_cache: Optional[Dict[str, Link]] = None
+        self._capacity_index_cache: Optional[Dict[str, float]] = None
 
     # -- construction ------------------------------------------------------
     def add_machine(self, machine: Machine) -> None:
@@ -150,6 +174,15 @@ class Fabric:
                        link.capacity_GBps, link.latency_ns)
             self._links[(rev.src, rev.dst)] = rev
             self._adj.setdefault(rev.src, []).append(rev)
+        # Every current builder finishes adding links before a fabric is
+        # ever handed to install() or a predictor (checked directly across
+        # src/ and tests/: every add_link call site sits inside a builder
+        # function, none after). This invalidates rather than assumes that
+        # stays true forever -- if something does call add_link after
+        # link_index() was already read once, the next read recomputes
+        # instead of serving a stale map.
+        self._link_index_cache = None
+        self._capacity_index_cache = None
 
     def bind_nic(self, gpu: GpuId, nic: NicId) -> None:
         """Which NIC a GPU egresses through. This is what makes egress
@@ -164,6 +197,42 @@ class Fabric:
     @property
     def links(self) -> List[Link]:
         return list(self._links.values())
+
+    def link_index(self) -> Dict[str, Link]:
+        """`{link.id: link}` over every link in this fabric, built once and
+        cached on this instance rather than rebuilt by every caller.
+
+        Measured need: `network_for()`/`_path_latency_ns()`
+        (`engine/network/transfers.py`) each rebuilt this exact mapping on
+        every single call regardless of which one or two links a transfer
+        actually touched -- 87% of wall-clock on a 512-GPU fabric (task 26
+        report, S2.2). Safe to cache because nothing in this project
+        mutates a `Fabric` once it has been handed to `install()` or a
+        predictor: every `add_link` call site (`builders.py`,
+        `infragraph/parse.py`, `infragraph/blueprints.py`, and every test's
+        own fabric-construction helper) runs inside a builder function,
+        before the fabric is used elsewhere -- checked directly, not
+        assumed from `Fabric` not being a frozen dataclass. `add_link`
+        still invalidates this cache defensively (see there) in case that
+        ever stops being true.
+        """
+        if self._link_index_cache is None:
+            self._link_index_cache = {lk.id: lk for lk in self._links.values()}
+        return self._link_index_cache
+
+    def capacity_index(self) -> Dict[str, float]:
+        """`{link.id: link.capacity_GBps}` over every link -- the specific
+        projection `network_for()`'s flow model needs. Same cache, same
+        invalidation, same immutability argument as `link_index()`; kept
+        separate because `FlowNetwork` wants capacities, not `Link` objects,
+        and building this dict fresh from `link_index()` on every call
+        would still pay for a fresh 131,600-entry dict each time -- the
+        cost `link_index()` exists to remove, not move.
+        """
+        if self._capacity_index_cache is None:
+            self._capacity_index_cache = {lk.id: lk.capacity_GBps
+                                          for lk in self._links.values()}
+        return self._capacity_index_cache
 
     def domain_of(self, gpu: GpuId) -> Optional[int]:
         return self._gpu_domain.get(gpu)

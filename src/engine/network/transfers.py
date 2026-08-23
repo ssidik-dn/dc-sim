@@ -30,9 +30,16 @@ class Transfer:
 
 
 def network_for(fabric: Fabric, verify: bool = True) -> FlowNetwork:
-    """A flow model over every link in the fabric."""
-    return FlowNetwork({lk.id: lk.capacity_GBps for lk in fabric.links},
-                       verify=verify)
+    """A flow model over every link in the fabric.
+
+    `fabric.capacity_index()` is cached on the `Fabric` object itself
+    (task 29) -- this used to rebuild a fresh `{id: capacity}` dict over
+    every link in the fabric on every call, measured as the dominant cost
+    at scale (task 26 report, S2.2). `FlowNetwork.__init__` copies whatever
+    dict it's given (`self.capacity = dict(capacity)`), so handing it the
+    same cached dict on every call is safe -- nothing here can mutate the
+    cache through the `FlowNetwork` it feeds."""
+    return FlowNetwork(fabric.capacity_index(), verify=verify)
 
 
 def _path_latency_ns(fabric: Fabric, links: List[str]) -> float:
@@ -40,8 +47,12 @@ def _path_latency_ns(fabric: Fabric, links: List[str]) -> float:
     only ever sees link ids (`links: Sequence[LinkKey]` in `submit()`), not
     `Link` objects -- it has no `latency_ns` to read. This module has the
     real `Link` objects (from `fabric.path()`/`fabric.route()`), so it
-    computes the path term here and passes it through explicitly."""
-    by_id = {lk.id: lk for lk in fabric.links}
+    computes the path term here and passes it through explicitly.
+
+    `fabric.link_index()` (task 29) is exactly the `{id: Link}` mapping
+    this used to rebuild fresh on every call -- same cache `network_for`
+    now uses, cached once on the `Fabric` object rather than here."""
+    by_id = fabric.link_index()
     return sum(by_id[lid].latency_ns for lid in links)
 
 
