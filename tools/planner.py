@@ -76,6 +76,21 @@ class ModelSpec:
     is_moe: bool
     admissible_tp: Tuple[int, ...] = (1, 2, 4, 8)
     admissible_ep: Tuple[int, ...] = (1,)
+    # Needed by `feasible_num_blocks` (below) to compute DECODE_ATTN's own
+    # parameter and KV-cache memory directly from Frontier's own formula
+    # (`param_counter.py`/`memory_planner.py`, verified bit-for-bit against
+    # Phi-tiny-MoE-instruct's own calibrated table in task 33/36) rather
+    # than a per-model lookup table. `head_dim=None` means "derive as
+    # hidden_size // num_attention_heads", matching
+    # `ModelConfig.get_head_dim()`'s own fallback -- only override it when
+    # the model's own JSON declares an explicit `head_dim` different from
+    # that (Phi-tiny-MoE-instruct does; Llama-3.1-405B-Instruct-FP8 does
+    # not, both confirmed by reading the JSON directly, not assumed).
+    hidden_size: int = 0
+    num_attention_heads: int = 0
+    num_key_value_heads: int = 0
+    num_layers: int = 0
+    head_dim: Optional[int] = None
 
 
 @dataclass
@@ -131,31 +146,71 @@ class Candidate:
 
 # ------------------------------------------------------ memory feasibility
 
-# Calibrated, cited from tasks 25/26/28 rather than re-derived: per-device
-# parameter memory and KV page size for Phi-tiny-MoE-instruct on h800, by
-# attn_tensor_parallel_size. A different ModelSpec/Hardware would need its
-# own calibration -- this table is named for what it is, not treated as
-# universal.
-_PARAM_MEM_BYTES = {1: 1342177280, 2: 671088640, 4: 335544320, 8: 201326592}
-_PAGE_SIZE_BYTES = {1: 1048576, 2: 524288, 4: 262144, 8: 262144}
-_DEVICE_MEMORY_BYTES = {"h800": 80 * 1024 ** 3}
+# Real device memory, in GB -- `frontier/config/device_sku_config.py`'s own
+# SKU table (task 35's own finding), not assumed.
+_DEVICE_MEMORY_GB = {
+    "a40": 45, "a100": 80, "a800": 80, "h100": 80, "h800": 80,
+    "h20": 96, "rtx_pro_6000": 96, "h200": 141, "mi355x": 288,
+}
+
+_KV_CACHE_BLOCK_SIZE = 16  # this project's own standing convention (tasks 22-33)
+_KV_FACTOR = 2  # DENSE_KV family (standard MHA/GQA, K+V) -- frontier/attention/families.py
+
+
+def _attn_head_dim(model: ModelSpec) -> int:
+    return model.head_dim if model.head_dim is not None else model.hidden_size // model.num_attention_heads
+
+
+def attn_param_mem_bytes(model: ModelSpec, attn_tp: int) -> int:
+    """DECODE_ATTN's own per-device parameter memory at this `attn_tp`,
+    computed directly from `frontier/utils/param_counter.py`'s own
+    formula (Q/K/V/O only -- DECODE_FFN's MLP/MoE weights are a separate
+    cluster's memory, task 35's own S0 scoping point) and
+    `frontier/scheduler/utils/memory_planner.py`'s own unconditional
+    2-bytes/param assumption. Verified bit-for-bit against
+    `ParamCounter.get_num_parameters_per_device()` for both
+    Phi-tiny-MoE-instruct (671088640/335544320/167772160/100663296 params
+    at tp=1/2/4/8) and Llama-3.1-405B-Instruct-FP8
+    (71873593344/35936796672/17968398336/8984199168/4756340736/2642411520
+    at tp=1/2/4/8/16/32) before use, not assumed from a formula alone."""
+    head_dim = _attn_head_dim(model)
+    q_per_worker = model.num_attention_heads / attn_tp
+    kv_per_worker = -(-model.num_key_value_heads // attn_tp)  # ceil
+    per_layer = (model.hidden_size * head_dim * (q_per_worker + 2 * kv_per_worker)
+                + model.hidden_size * head_dim * q_per_worker)
+    return int(2 * per_layer * model.num_layers)
+
+
+def _kv_cache_page_bytes_per_layer(model: ModelSpec, attn_tp: int, block_size: int) -> int:
+    """`frontier/scheduler/utils/memory_planner.py`'s own
+    `_get_kv_cache_memory_per_layer_per_block`: 2 bytes/element x
+    block_size x kv_factor x kv_heads_per_worker x head_dim."""
+    head_dim = _attn_head_dim(model)
+    kv_per_worker = -(-model.num_key_value_heads // attn_tp)
+    return 2 * block_size * _KV_FACTOR * kv_per_worker * head_dim
 
 
 def feasible_num_blocks(model: ModelSpec, hardware: Hardware, attn_tp: int) -> Optional[int]:
-    """`None` if infeasible (parameter memory alone exceeds the budget at
-    this margin); otherwise the derived `num_blocks` -- task 24's own
-    formula, cited not re-derived."""
-    if model.model_name != "Phi-tiny-MoE-instruct" or hardware.device != "h800":
-        raise NotImplementedError(
-            "feasible_num_blocks' calibration table is for Phi-tiny-MoE-instruct "
-            "on h800 only (tasks 25/26/28) -- a different model/device needs its "
-            "own calibration before this function can answer for it.")
-    device_bytes = _DEVICE_MEMORY_BYTES[hardware.device]
-    usable = (1 - hardware.memory_margin_fraction) * device_bytes
-    avail = usable - _PARAM_MEM_BYTES[attn_tp]
+    """`None` if infeasible (parameter memory alone exceeds the usable
+    budget at this margin); otherwise the derived `num_blocks`, from
+    `frontier/scheduler/utils/memory_planner.py`'s own `get_num_blocks`
+    formula: `available_kv_cache_memory // page_size // num_layers`,
+    `available_kv_cache_memory = requested_memory - parameter_memory`."""
+    if model.num_attention_heads <= 0 or model.hidden_size <= 0 or model.num_layers <= 0:
+        raise ValueError(
+            f"ModelSpec({model.model_name!r}) is missing hidden_size/"
+            "num_attention_heads/num_key_value_heads/num_layers -- "
+            "feasible_num_blocks needs them to compute DECODE_ATTN's own "
+            "memory directly, not a per-model lookup table.")
+    device_bytes = _DEVICE_MEMORY_GB[hardware.device] * 1024 ** 3
+    requested_memory = int(device_bytes * (1 - hardware.memory_margin_fraction))
+    param_mem = attn_param_mem_bytes(model, attn_tp)
+    avail = requested_memory - param_mem
     if avail <= 0:
         return None
-    return int(avail // _PAGE_SIZE_BYTES[attn_tp])
+    page_size = _kv_cache_page_bytes_per_layer(model, attn_tp, _KV_CACHE_BLOCK_SIZE)
+    num_blocks = avail // page_size // model.num_layers
+    return int(num_blocks) if num_blocks > 0 else None
 
 
 def lane_assignment_feasible(attn_replicas: int, ffn_replicas: int, attn_dp_size: int) -> bool:
@@ -359,10 +414,15 @@ def _run_scenario(topology_name: str, model_name: str, candidate_key: str,
                   attn_replicas: int, ffn_replicas: int, num_blocks: int,
                   memory_margin: float, num_requests: int, qps: float,
                   prefill_tokens: int, decode_tokens: int, device: str,
-                  total_experts: int, router_topk: int,
+                  total_experts: int, router_topk: int, is_moe: bool,
+                  hidden_size: int, num_attention_heads: int,
+                  num_key_value_heads: int, num_layers: int, head_dim: Optional[int],
                   seed: int, seeded: bool) -> None:
     topology = _TOPOLOGIES[topology_name]()
-    model = ModelSpec(model_name, total_experts, router_topk, is_moe=True)
+    model = ModelSpec(model_name, total_experts, router_topk, is_moe=is_moe,
+                      hidden_size=hidden_size, num_attention_heads=num_attention_heads,
+                      num_key_value_heads=num_key_value_heads, num_layers=num_layers,
+                      head_dim=head_dim)
     workload = Workload(num_requests, qps, prefill_tokens, decode_tokens)
     hardware = Hardware(device, memory_margin)
     shape = tuple(int(x) for x in attn_shape.split(","))
@@ -442,7 +502,12 @@ def evaluate(topology: Topology, model: ModelSpec, workload: Workload, hardware:
          "--num-requests", str(workload.num_requests), "--qps", str(workload.qps),
          "--prefill-tokens", str(workload.prefill_tokens), "--decode-tokens", str(workload.decode_tokens),
          "--device", hardware.device, "--total-experts", str(model.total_experts),
-         "--router-topk", str(model.router_topk),
+         "--router-topk", str(model.router_topk), "--is-moe", "1" if model.is_moe else "0",
+         "--hidden-size", str(model.hidden_size),
+         "--num-attention-heads", str(model.num_attention_heads),
+         "--num-key-value-heads", str(model.num_key_value_heads),
+         "--num-layers", str(model.num_layers),
+         "--head-dim", str(model.head_dim) if model.head_dim is not None else "none",
          "--seed", str(seed), "--seeded", "1" if seeded else "0"],
         capture_output=True, text=True, cwd=str(FRONTIER_ROOT))
     for line in proc.stdout.splitlines():
@@ -557,8 +622,29 @@ def _topology_oversubscribed():
     return Topology(fabric, "oversubscribed")
 
 
+def _topology_domain8_40gpu():
+    """Task 36's own Fabric A: 5 domains x 8 GPUs = 40 GPUs total."""
+    from engine.physical.builders import build_node_scale
+    fabric = build_node_scale(num_machines=5, gpus_per_machine=8,
+                              scale_up_GBps=400.0, scale_out_GBps=50.0)
+    return Topology(fabric, "domain8_40gpu")
+
+
+def _topology_domain4_40gpu():
+    """Task 36's own Fabric B: 10 domains x 4 GPUs = 40 GPUs total --
+    same total capacity as Fabric A, smaller domains only (this task's
+    own known trap: equal total GPUs, or the comparison confounds domain
+    size with capacity)."""
+    from engine.physical.builders import build_node_scale
+    fabric = build_node_scale(num_machines=10, gpus_per_machine=4,
+                              scale_up_GBps=400.0, scale_out_GBps=50.0)
+    return Topology(fabric, "domain4_40gpu")
+
+
 _TOPOLOGIES = {
     "task32repro": _topology_task32repro,
+    "domain8_40gpu": _topology_domain8_40gpu,
+    "domain4_40gpu": _topology_domain4_40gpu,
     "domain8": _topology_domain8,
     "domain64": _topology_domain64,
     "oversubscribed": _topology_oversubscribed,
@@ -586,15 +672,25 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="h800")
     parser.add_argument("--total-experts", type=int, default=16)
     parser.add_argument("--router-topk", type=int, default=2)
+    parser.add_argument("--is-moe", type=int, default=1)
+    parser.add_argument("--hidden-size", type=int, default=0)
+    parser.add_argument("--num-attention-heads", type=int, default=0)
+    parser.add_argument("--num-key-value-heads", type=int, default=0)
+    parser.add_argument("--num-layers", type=int, default=0)
+    parser.add_argument("--head-dim", type=str, default="none")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seeded", type=int, default=0)
     args = parser.parse_args()
     if args.topology is not None:
+        head_dim = None if args.head_dim == "none" else int(args.head_dim)
         _run_scenario(args.topology, args.model_name, args.candidate_key,
                      args.attn_tp, args.attn_shape, args.ffn_ep, bool(args.ep_split),
                      args.attn_replicas, args.ffn_replicas, args.num_blocks,
                      args.memory_margin, args.num_requests, args.qps,
                      args.prefill_tokens, args.decode_tokens, args.device,
-                     args.total_experts, args.router_topk, args.seed, bool(args.seeded))
+                     args.total_experts, args.router_topk, bool(args.is_moe),
+                     args.hidden_size, args.num_attention_heads,
+                     args.num_key_value_heads, args.num_layers, head_dim,
+                     args.seed, bool(args.seeded))
         raise SystemExit(0)
     raise SystemExit(0)
