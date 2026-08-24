@@ -81,6 +81,8 @@ def clos_fat_tree_fabric(
     gpus_per_machine: int = 1,
     nics_per_machine: int = 1,
     oversubscription: float = 1.0,
+    oversubscription_edge_agg: float = 1.0,
+    oversubscription_agg_core: float = 1.0,
     scale_up_GBps: float = 400.0,
     scale_up_latency_ns: float = 936.25,
     nic_gbps: float = 400.0,
@@ -125,16 +127,62 @@ def clos_fat_tree_fabric(
 
     depth=1 has no spine layer and delegates to `single_tier_fabric`,
     treating switch_radix as the host count directly (no uplinks needed, so
-    every port serves a host). depth>2 raises rather than approximate a
-    three-tier fat tree: it needs a real aggregation tier and different
-    counts, not a guess at wiring one in by hand.
+    every port serves a host).
+
+    depth=3 is a three-tier Al-Fares fat tree -- pods, each with an edge
+    and an aggregation layer, plus a core tier shared across pods:
+
+        pods              = k
+        edge per pod      = k/2
+        aggregation/pod   = k/2
+        core              = (k/2)^2
+        hosts per edge    = k/2
+        total hosts       = k^3/4
+
+    Task 02's own error (task 03's report) was building exactly these
+    edge/core counts *without* the aggregation tier -- arithmetically
+    consistent, and disconnected, because an edge switch's k/2 uplinks
+    could then reach only a k/2 subset of a much larger spine set. Wiring
+    the aggregation tier correctly requires a plane structure: core
+    switches are grouped into k/2 planes of k/2 each, and aggregation
+    switch j (0-indexed within its own pod) connects to every core switch
+    in plane j, and only those. This is what makes the construction
+    connected -- an aggregation switch j in pod A and aggregation switch
+    j in pod B share every one of plane j's core switches, so any pod can
+    reach any other through its own switch-j aggregation and any core
+    switch in plane j, while an edge switch reaches every other edge
+    switch *in its own pod* one tier lower, through aggregation alone,
+    never touching core.
+
+    Two independent oversubscription ratios, not one, because a real
+    three-tier fabric's two uplink tiers are provisioned independently:
+    `oversubscription_edge_agg` scales edge-to-aggregation capacity
+    relative to the fully-provisioned base rate
+    (`nics_per_machine * scale_out_GBps`) an edge switch's own aggregate
+    host-facing capacity reduces to (exactly `oversubscription`'s own
+    meaning at depth=2, since an edge switch's own downlink/uplink
+    structure is identical to a depth=2 leaf's); `oversubscription_agg_core`
+    scales aggregation-to-core capacity relative to that *same*
+    fully-provisioned base rate, not relative to whatever
+    `oversubscription_edge_agg` already reduced edge-to-aggregation links
+    to. Measuring both against the same fixed base, rather than chaining
+    the second through the first's own already-reduced result, is what
+    keeps them independent -- the first implementation of this chained
+    the two, and `oversubscription_agg_core` moved
+    `oversubscription_edge_agg`'s own capacity as a side effect until a
+    test caught it.
+
+    depth>3 raises rather than approximate a four-tier fat tree: the same
+    reasoning that deferred three tiers until their own counts and wiring
+    were derived (task 03's own report) applies to a fourth, and nothing
+    in this project needs one.
     """
-    if depth > 2:
+    if depth > 3:
         raise NotImplementedError(
-            f"depth={depth} fat trees are not implemented; a three-tier "
-            f"topology needs an aggregation tier and different counts, and "
-            f"wiring one in by hand risks a plausible-looking wrong answer, "
-            f"so this raises instead of approximating one")
+            f"depth={depth} fat trees are not implemented; depth=3 is as far "
+            f"as this project has derived counts and wiring for (task 40), "
+            f"and wiring a fourth tier in by hand risks a plausible-looking "
+            f"wrong answer, so this raises instead of approximating one")
 
     if depth == 1:
         return single_tier_fabric(
@@ -158,9 +206,16 @@ def clos_fat_tree_fabric(
             f"construction doesn't apply")
 
     half = k // 2
-    num_leaves, num_spines, hosts_per_leaf = k, half, half
-
     egress_GBps = gbps_to_GBps(nic_gbps)
+
+    if depth == 3:
+        return _three_tier_fat_tree(
+            k, half, gpus_per_machine, nics_per_machine,
+            oversubscription_edge_agg, oversubscription_agg_core,
+            scale_up_GBps, scale_up_latency_ns, egress_GBps, egress_latency_ns,
+            scale_out_GBps, scale_out_latency_ns, name)
+
+    num_leaves, num_spines, hosts_per_leaf = k, half, half
 
     # Oversubscription is a ratio of aggregates, not a per-link fraction: at
     # 4:1 the SUM of a leaf's uplinks is a quarter of the SUM of its
@@ -184,5 +239,105 @@ def clos_fat_tree_fabric(
         for spine in spines:
             fab.add_link(Link(leaf, spine, LinkClass.SCALE_OUT,
                               uplink_GBps, scale_out_latency_ns))
+
+    return fab
+
+
+def _three_tier_fat_tree(
+    k: int, half: int, gpus_per_machine: int, nics_per_machine: int,
+    oversubscription_edge_agg: float, oversubscription_agg_core: float,
+    scale_up_GBps: float, scale_up_latency_ns: float,
+    egress_GBps: float, egress_latency_ns: float,
+    scale_out_GBps: float, scale_out_latency_ns: float, name: str,
+) -> Fabric:
+    """The depth=3 construction `clos_fat_tree_fabric`'s own docstring
+    describes. Kept as a private helper rather than inlined, the same
+    reason `_wire_machine` is: the depth=2 body above it must stay
+    byte-for-byte what it was before this task, and interleaving a third
+    tier's own wiring into it by editing in place is exactly the kind of
+    change that risks moving a line the depth=2 path also runs.
+
+    `half = k // 2` throughout: pods_per_fabric = k, edges_per_pod =
+    aggs_per_pod = num_planes = core_per_plane = hosts_per_edge = half.
+    Global (not per-pod) indices for every switch id, so a pod's own
+    aggregation switch `j` and a different pod's aggregation switch `j`
+    -- which must be distinct switches, sharing only their *plane*, not
+    their identity -- never collide.
+    """
+    num_pods = k
+    edges_per_pod = half
+    aggs_per_pod = half
+    num_planes = half
+    core_per_plane = half
+    hosts_per_edge = half
+
+    # Two *independent* ratios -- each measured against the same
+    # fully-provisioned base rate (nics_per_machine * scale_out_GBps), not
+    # against each other's already-oversubscribed result. This is what
+    # makes them independent: an aggregation switch's own aggregate
+    # downlink-facing capacity is defined here as what its edges_per_pod
+    # downlinks would carry at the *fully-provisioned* rate (as if
+    # oversubscription_edge_agg were 1.0), not at whatever
+    # oversubscription_edge_agg actually reduced them to -- chaining
+    # through the already-reduced edge_to_agg_GBps value instead would
+    # make oversubscription_agg_core's own effect depend on
+    # oversubscription_edge_agg, which is exactly the coupling a caller
+    # setting "one ratio" should not get (confirmed by a test failure
+    # during this task's own development, not assumed safe by
+    # construction -- see the task 40 report).
+    #
+    # Edge -> aggregation: identical reasoning to the depth=2 leaf ->
+    # spine formula, applied to one pod's own edge/aggregation pair --
+    # an edge switch's aggregate downlink is (hosts_per_edge *
+    # nics_per_machine * scale_out_GBps), split over its own
+    # aggs_per_pod uplinks; hosts_per_edge == aggs_per_pod == half here
+    # too, so that count cancels the same way.
+    edge_to_agg_GBps = (nics_per_machine * scale_out_GBps) / oversubscription_edge_agg
+
+    # Aggregation -> core: an aggregation switch's own aggregate
+    # downlink-facing capacity, at the fully-provisioned rate, is
+    # (edges_per_pod * nics_per_machine * scale_out_GBps), split over its
+    # own core_per_plane uplinks; edges_per_pod == core_per_plane == half
+    # again, so the same cancellation gives the same base-rate formula,
+    # with its own ratio.
+    agg_to_core_GBps = (nics_per_machine * scale_out_GBps) / oversubscription_agg_core
+
+    fab = Fabric(name)
+    # core[plane][position] -- plane p's own half switches, globally
+    # indexed so no two planes' switches collide.
+    core = [[SwitchId("core", p * core_per_plane + c) for c in range(core_per_plane)]
+           for p in range(num_planes)]
+
+    mid = 0
+    for pod in range(num_pods):
+        edges = [SwitchId("edge", pod * edges_per_pod + e) for e in range(edges_per_pod)]
+        aggs = [SwitchId("aggregation", pod * aggs_per_pod + j) for j in range(aggs_per_pod)]
+
+        for edge in edges:
+            for _ in range(hosts_per_edge):
+                _wire_machine(fab, mid, gpus_per_machine, nics_per_machine, edge,
+                             scale_up_GBps, scale_up_latency_ns,
+                             egress_GBps, egress_latency_ns,
+                             scale_out_GBps, scale_out_latency_ns)
+                mid += 1
+            # Full mesh within this pod: every edge switch to every
+            # aggregation switch of the *same* pod, one link each --
+            # edges_per_pod == aggs_per_pod == half, so each edge's own
+            # half uplink ports and each aggregation switch's own half
+            # downlink ports are exactly filled by this loop alone.
+            for agg in aggs:
+                fab.add_link(Link(edge, agg, LinkClass.SCALE_OUT,
+                                  edge_to_agg_GBps, scale_out_latency_ns))
+
+        # The plane structure: aggregation switch j (local to this pod)
+        # connects to every core switch in plane j, and only plane j --
+        # omitting this (connecting to some other, arbitrary subset of
+        # core switches instead) is exactly the mistake that disconnected
+        # Task 02's own construction, one tier up from where it happened
+        # there.
+        for j, agg in enumerate(aggs):
+            for core_switch in core[j]:
+                fab.add_link(Link(agg, core_switch, LinkClass.SCALE_OUT,
+                                  agg_to_core_GBps, scale_out_latency_ns))
 
     return fab

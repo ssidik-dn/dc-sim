@@ -397,6 +397,34 @@ def _topology_domain4_40gpu():
     return Topology(fabric, "domain4_40gpu")
 
 
+def _topology_clos_2tier_128():
+    """Task 40's own Fabric A: a two-tier leaf-spine Clos, radix 16 --
+    spines=8, leaves=16, hosts_per_leaf=8, total hosts (=GPUs, at
+    gpus_per_machine=1) = 16^2/2 = 128."""
+    from engine.infragraph.blueprints import clos_fat_tree_fabric
+    fabric = clos_fat_tree_fabric(switch_radix=16, depth=2, gpus_per_machine=1,
+                                  nics_per_machine=1, scale_up_GBps=400.0,
+                                  scale_up_latency_ns=936.25, nic_gbps=400.0,
+                                  egress_latency_ns=2000.0, scale_out_GBps=50.0,
+                                  scale_out_latency_ns=5000.0, name="clos_2tier_128")
+    return Topology(fabric, "clos_2tier_128")
+
+
+def _topology_clos_3tier_128():
+    """Task 40's own Fabric B: a three-tier fat tree, radix 8 -- pods=8,
+    edges/pod=aggs/pod=4, core=16, hosts_per_edge=4, total hosts (=GPUs,
+    at gpus_per_machine=1) = 8^3/4 = 128 -- the same total GPU count as
+    Fabric A, so the comparison is tier structure, not capacity (task 36's
+    own known trap, reused here)."""
+    from engine.infragraph.blueprints import clos_fat_tree_fabric
+    fabric = clos_fat_tree_fabric(switch_radix=8, depth=3, gpus_per_machine=1,
+                                  nics_per_machine=1, scale_up_GBps=400.0,
+                                  scale_up_latency_ns=936.25, nic_gbps=400.0,
+                                  egress_latency_ns=2000.0, scale_out_GBps=50.0,
+                                  scale_out_latency_ns=5000.0, name="clos_3tier_128")
+    return Topology(fabric, "clos_3tier_128")
+
+
 _TOPOLOGIES = {
     "task32repro": _topology_task32repro,
     "domain8_40gpu": _topology_domain8_40gpu,
@@ -404,6 +432,8 @@ _TOPOLOGIES = {
     "domain8": _topology_domain8,
     "domain64": _topology_domain64,
     "oversubscribed": _topology_oversubscribed,
+    "clos_2tier_128": _topology_clos_2tier_128,
+    "clos_3tier_128": _topology_clos_3tier_128,
 }
 
 
