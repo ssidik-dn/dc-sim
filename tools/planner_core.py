@@ -152,14 +152,23 @@ class Candidate:
     attn_tp: int
     attn_shape: Tuple[int, ...]
     ffn_ep: int = 1
-    ep_split: bool = False
+    # Task 44: the expert-parallel group's own placement, exactly the
+    # same kind of value `attn_shape` already is -- `(1,)` at `ffn_ep=1`
+    # (no expert-parallel group exists), otherwise a real
+    # `Placement.group_shape()` result from `enumerate_joint_arrangements`.
+    # Replaces `ep_split: bool`, a field this project carried since task
+    # 33 that no placement logic ever actually read (checked directly:
+    # neither `_placement_for` nor `_run_scenario` ever inspected it) --
+    # exactly the gap this task exists to close, not a second flag kept
+    # alongside the real one.
+    ep_shape: Tuple[int, ...] = (1,)
     attn_replicas: int = 1
     ffn_replicas: int = 1
 
     @property
     def key(self) -> str:
         return (f"tp{self.attn_tp}_shape{'-'.join(map(str, self.attn_shape))}"
-               f"_ep{self.ffn_ep}{'s' if self.ep_split else ''}"
+               f"_ep{self.ffn_ep}_epshape{'-'.join(map(str, self.ep_shape))}"
                f"_ar{self.attn_replicas}_fr{self.ffn_replicas}")
 
 
@@ -523,6 +532,112 @@ def enumerate_replica_arrangements(topology: Topology, attn_tp: int, attn_replic
     return arrangements
 
 
+def enumerate_joint_arrangements(topology: Topology, attn_tp: int, ffn_ep: int,
+                                 n_fragmented_seeds: int = 60
+                                 ) -> Dict[Tuple[Tuple[int, ...], Tuple[int, ...]], object]:
+    """Task 44's own extension: `enumerate_attn_shapes` (task 32) searches
+    DECODE_ATTN's own TP group in isolation; this searches DECODE_ATTN's
+    TP group and DECODE_FFN's own expert-parallel group *together*, on
+    the same deployment, against the same fabric -- because they may
+    share domains, and a search that enumerated each alone and combined
+    the results afterward would silently assume the two never interact
+    (task 44's own S2 question, answered by construction here: the raw
+    candidates below place both groups on one real fabric at once, so
+    whatever interaction exists is however `packed`/`spread`/`fragmented`
+    actually resolve it, not assumed away).
+
+    **Not task 41's multiset.** An attention TP group and an expert
+    group are different kinds of thing -- one shards attention weights,
+    the other dispatches tokens to experts -- so giving shape A to
+    attention and shape B to the expert group is a *different*
+    arrangement from giving A to the expert group and B to attention.
+    The canonical key is an ordered pair, `(attn_shape, ep_shape)`,
+    never sorted together: task 41's own interchangeable-replica
+    reasoning applies to *enumerating* several groups of the *same*
+    kind (task 41's own attention replicas), not to two groups of
+    different kinds, which is exactly this task's own known trap.
+
+    At `ffn_ep=1` there is no expert-parallel group at all
+    (`Replica.groups()` returns `[]` for a degree-1 dimension, same as
+    `enumerate_attn_shapes` at `attn_tp=1`) -- `ep_shape` is then always
+    `(1,)`, and the set of `attn_shape` values this function reaches is
+    identical to `enumerate_attn_shapes`'s own, built from the same
+    deployment shape, the same policies, the same seeds. This is what
+    keeps the `ffn_ep=1` case bit-identical to every call site that
+    predates this task (task 44's own acceptance requirement).
+    """
+    fabric = topology.fabric
+    d = Deployment("joint-arrangement-probe")
+    d.add(Replica(PoolKind.PREFILL, 0, tp=1))
+    d.add(Replica(PoolKind.DECODE_ATTN, 0, tp=attn_tp))
+    d.add(Replica(PoolKind.DECODE_FFN, 0, tp=1, ep=ffn_ep))
+
+    attn_replica = d.pool(PoolKind.DECODE_ATTN)[0]
+    ffn_replica = d.pool(PoolKind.DECODE_FFN)[0]
+    attn_group = attn_replica.groups(ParallelKind.TP)[0] if attn_tp > 1 else None
+    ep_group = ffn_replica.groups(ParallelKind.EP)[0] if ffn_ep > 1 else None
+
+    candidates = []
+    for policy in (packed, spread):
+        try:
+            candidates.append(policy(d, fabric))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # The same explicit "packed-if-it-fits" fallback enumerate_attn_shapes
+    # already needs (task 34's own finding: packed()'s own rank ordering
+    # gives a later group a one-slot offset from an earlier one, so it
+    # does not reach a clean single-domain shape on its own even when one
+    # would fit) -- extended to place the expert group in its own third
+    # domain, not just the attention group in its own second one, so the
+    # "everything stays whole" arrangement is actually reachable for both
+    # groups at once when the fabric has room for it.
+    domain_size = min(len(dom.members) for dom in fabric.domains.values())
+    domain_ids = sorted(fabric.domains)
+    if len(domain_ids) >= 3:
+        prefill_rank = d.replicas[0].ranks[0]
+        ffn_anchor_rank = ffn_replica.ranks[0]
+        mapping = {}
+        base_members = sorted(fabric.domains[domain_ids[0]].members)
+        mapping[prefill_rank] = base_members[0]
+        mapping[ffn_anchor_rank] = base_members[1]
+        ok = True
+        if attn_group is not None:
+            if attn_tp <= domain_size:
+                attn_members = sorted(fabric.domains[domain_ids[1]].members)
+                for i, r in enumerate(attn_group.ranks):
+                    mapping[r] = attn_members[i]
+            else:
+                ok = False
+        if ok and ep_group is not None:
+            if ffn_ep <= domain_size:
+                ep_members = sorted(fabric.domains[domain_ids[2]].members)
+                for i, r in enumerate(ep_group.ranks):
+                    mapping[r] = ep_members[i]
+            else:
+                ok = False
+        if ok:
+            try:
+                candidates.append(explicit(d, fabric, mapping))
+            except Exception:  # noqa: BLE001
+                pass
+
+    for seed in range(n_fragmented_seeds):
+        try:
+            candidates.append(fragmented(d, fabric, seed=seed))
+        except Exception:  # noqa: BLE001
+            pass
+
+    arrangements: Dict[Tuple[Tuple[int, ...], Tuple[int, ...]], object] = {}
+    for p in candidates:
+        attn_shape = p.group_shape(attn_group) if attn_group is not None else (1,)
+        ep_shape = p.group_shape(ep_group) if ep_group is not None else (1,)
+        key = (attn_shape, ep_shape)
+        if key not in arrangements:
+            arrangements[key] = p
+    return arrangements
+
+
 # ------------------------------------------------------------------- plan()
 
 
@@ -620,18 +735,27 @@ def plan(topology: Topology, model: ModelSpec, workload: Workload, hardware: Har
         if num_blocks is None:
             rejections.append(Rejection(f"tp{attn_tp}_*", "memory: infeasible at this margin"))
             continue
-        shapes = enumerate_attn_shapes(topology, attn_tp)
-        for shape in shapes:
-            for ep in ep_values:
+        for ep in ep_values:
+            # Task 44: the attention TP group and the expert-parallel
+            # group are enumerated *together* (S2's own independence
+            # question), not `enumerate_attn_shapes` alone followed by a
+            # separately-chosen `ep_shape` -- at `ep=1` this reaches the
+            # identical set of `attn_shape` values `enumerate_attn_shapes`
+            # itself would (see `enumerate_joint_arrangements`'s own
+            # docstring for why), which is what keeps every pre-task-44
+            # call site (`ep_values` defaulting to `(1,)`) bit-identical.
+            joint = enumerate_joint_arrangements(topology, attn_tp, ep)
+            for shape, ep_shape in joint:
                 for attn_replicas, ffn_replicas in replica_ratios:
                     attn_dp_size = attn_dp_size_policy(attn_replicas, ffn_replicas)
                     if not lane_assignment_feasible(attn_replicas, ffn_replicas, attn_dp_size):
                         inadmissible.append(Inadmissible(
-                            f"tp{attn_tp}_shape{shape}_ep{ep}_ar{attn_replicas}_fr{ffn_replicas}",
+                            f"tp{attn_tp}_shape{shape}_ep{ep}_epshape{ep_shape}"
+                            f"_ar{attn_replicas}_fr{ffn_replicas}",
                             f"lane assignment: attn_replicas({attn_replicas})*attn_dp_size"
                             f"({attn_dp_size}) < ffn_replicas({ffn_replicas})"))
                         continue
-                    candidate = Candidate(attn_tp, shape, ep, False, attn_replicas, ffn_replicas)
+                    candidate = Candidate(attn_tp, shape, ep, ep_shape, attn_replicas, ffn_replicas)
                     if not evaluator.can_evaluate(candidate):
                         unknown.append(Unknown(candidate.key,
                             "evaluator cannot price this candidate (outside its own coverage)"))

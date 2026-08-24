@@ -33,7 +33,8 @@ from planner_core import (  # noqa: E402
     divisibility_violations, attn_param_mem_bytes, InadmissibleDegree,
     _kv_cache_page_bytes_per_layer,
     lane_assignment_feasible, default_attn_dp_size_policy,
-    enumerate_replica_arrangements,
+    enumerate_replica_arrangements, enumerate_attn_shapes,
+    enumerate_joint_arrangements,
 )
 from engine.physical.builders import build_node_scale  # noqa: E402
 
@@ -478,3 +479,152 @@ def test_enumerate_replica_arrangements_treats_swapped_shapes_as_one_arrangement
     assert len(mixed_keys) <= 1
     if mixed_keys:
         assert mixed_keys[0] == ((1, 1), (2,))
+
+
+# ---------------------------------------- enumerate_joint_arrangements (task 44)
+
+
+def _three_domain_topology():
+    """12 GPUs, 3 domains of 4 -- enough room for attention (up to
+    tp=4) and an expert group (up to ep=4) to each get their own whole
+    domain simultaneously, which is what the "packed-if-it-fits"
+    explicit fallback needs a third domain for."""
+    fabric = build_node_scale(num_machines=3, gpus_per_machine=4)
+    return Topology(fabric, "three-domain-test-fabric")
+
+
+def test_enumerate_joint_arrangements_at_ep1_matches_enumerate_attn_shapes():
+    """At `ffn_ep=1` there is no expert-parallel group at all -- the set
+    of `attn_shape` values this function reaches, paired with the
+    trivial `(1,)` ep_shape, must be exactly what `enumerate_attn_shapes`
+    alone already reports. This is the literal check behind task 44's
+    own acceptance requirement: the single-expert-group case must not
+    move."""
+    topology = _wide_topology()
+    single = enumerate_attn_shapes(topology, attn_tp=2)
+    joint = enumerate_joint_arrangements(topology, attn_tp=2, ffn_ep=1)
+    assert set(joint.keys()) == {(shape, (1,)) for shape in single.keys()}
+
+
+def test_enumerate_joint_arrangements_reaches_the_fully_packed_pair_when_it_fits():
+    """On a fabric with room for both groups to each keep their own
+    whole domain, the arrangement where neither group splits at all
+    must be reachable -- the same "packed-if-it-fits" guarantee task 32
+    established for a single group, extended here to two groups placed
+    at once (task 44's own S2: enumerated together, not assumed
+    independent and combined afterward)."""
+    topology = _three_domain_topology()
+    joint = enumerate_joint_arrangements(topology, attn_tp=4, ffn_ep=4)
+    assert ((4,), (4,)) in joint
+
+
+def test_enumerate_joint_arrangements_keys_are_ordered_pairs_not_multisets():
+    """The known trap this task's own S6 names: an attention group and
+    an expert group are not interchangeable, so the canonical key must
+    be an ordered pair, `(attn_shape, ep_shape)` -- never sorted
+    together the way `enumerate_replica_arrangements`'s own multiset
+    key sorts two *attention* replicas' shapes against each other."""
+    topology = _three_domain_topology()
+    joint = enumerate_joint_arrangements(topology, attn_tp=4, ffn_ep=2)
+    for attn_shape, ep_shape in joint:
+        # every key is a 2-tuple of (attn_shape, ep_shape) in that fixed
+        # role order -- unlike a multiset key, swapping the two would be
+        # a different, meaningless pairing (an attention shape is never
+        # interchangeable with an expert-group shape), so nothing here
+        # sorts attn_shape and ep_shape against each other.
+        assert isinstance(attn_shape, tuple) and isinstance(ep_shape, tuple)
+    # the two roles have different reachable shape sets at (attn_tp=4,
+    # ffn_ep=2) -- attn_shape can be (4,)/(3,1)/... (S=5, task 32's own
+    # table); ep_shape can only be (2,)/(1,1) (S=2) -- so an ordered-pair
+    # key is not merely a stylistic choice here, the two axes are not
+    # even the same size.
+    attn_shapes_seen = {a for a, _ in joint}
+    ep_shapes_seen = {e for _, e in joint}
+    assert len(attn_shapes_seen) >= len(ep_shapes_seen)
+
+
+def test_enumerate_joint_arrangements_collapses_raw_candidates():
+    """The same style of figure task 32 (188 -> 16) and task 41 (its own
+    replica equivalent) reported: raw placements collapse to a much
+    smaller set of distinct (attn_shape, ep_shape) pairs."""
+    topology = _three_domain_topology()
+    joint = enumerate_joint_arrangements(topology, attn_tp=4, ffn_ep=4, n_fragmented_seeds=60)
+    raw_candidates = 2 + 1 + 60  # packed + spread + the explicit fallback + 60 fragmented
+    assert len(joint) < raw_candidates
+
+
+# ------------------------------------------------- plan() with expert placement
+
+
+class EpAwareFakeEvaluator(FakeEvaluator):
+    """Like `FakeEvaluator`, but also records every candidate it was
+    asked to price, so a test can inspect `ep_shape` without needing a
+    real evaluator."""
+
+    def __init__(self, price_by_tp: dict):
+        super().__init__(price_by_tp)
+        self.seen: list = []
+
+    def evaluate(self, candidate: Candidate) -> dict:
+        self.seen.append(candidate)
+        return super().evaluate(candidate)
+
+
+def test_plan_default_ep_values_gives_only_the_trivial_ep_shape():
+    """`ep_values` defaults to `model.admissible_ep`, itself defaulting
+    to `(1,)` -- every candidate `plan()` builds without an explicit
+    `ep_values` argument must carry the trivial `ep_shape=(1,)`, exactly
+    as it did before this task added a real one."""
+    objectives = Objectives(slo_tpot_ms=15.0, min_throughput_rps=0.0, minimize="mean_tpot_ms")
+    evaluator = EpAwareFakeEvaluator({
+        2: {"mean_tpot_ms": 10.0, "throughput_rps": 100.0, "slo_attainment": 0.9},
+    })
+    result = plan(_topology(), _model((2,)), _workload(), _hardware(), objectives, evaluator)
+    assert result.ranked
+    for r in result.ranked:
+        assert r["candidate"].ep_shape == (1,)
+
+
+def test_plan_restricted_to_single_expert_group_matches_the_unextended_search():
+    """Task 44's own required acceptance test: a search explicitly
+    restricted to `ep_values=(1,)` must give exactly what leaving
+    `ep_values` at its default gives -- the cleanest proof that adding
+    expert placement is an extension, not a change to the existing
+    default."""
+    objectives = Objectives(slo_tpot_ms=15.0, min_throughput_rps=0.0, minimize="mean_tpot_ms")
+    evaluator = EpAwareFakeEvaluator({
+        1: {"mean_tpot_ms": 20.0, "throughput_rps": 50.0, "slo_attainment": 0.5},
+        2: {"mean_tpot_ms": 10.0, "throughput_rps": 100.0, "slo_attainment": 0.9},
+    })
+
+    default_result = plan(_topology(), _model((1, 2)), _workload(), _hardware(),
+                          objectives, evaluator)
+    explicit_result = plan(_topology(), _model((1, 2)), _workload(), _hardware(),
+                           objectives, evaluator, ep_values=(1,))
+
+    assert [r["candidate"].key for r in default_result.ranked] == \
+        [r["candidate"].key for r in explicit_result.ranked]
+    assert [r["mean_tpot_ms"] for r in default_result.ranked] == \
+        [r["mean_tpot_ms"] for r in explicit_result.ranked]
+    assert default_result.winner["candidate"].key == explicit_result.winner["candidate"].key
+
+
+def test_plan_adding_ep_values_does_not_perturb_the_single_group_candidates():
+    """Adding a second `ffn_ep` value to search must not change what the
+    `ffn_ep=1` candidates themselves evaluate to -- the same acceptance
+    shape task 41 required of `replica_ratios`, applied here to expert
+    degree."""
+    objectives = Objectives(slo_tpot_ms=15.0, min_throughput_rps=0.0, minimize="mean_tpot_ms")
+    evaluator = EpAwareFakeEvaluator({
+        2: {"mean_tpot_ms": 10.0, "throughput_rps": 100.0, "slo_attainment": 0.9},
+    })
+
+    narrow = plan(_topology(), _model((2,)), _workload(), _hardware(), objectives, evaluator,
+                 ep_values=(1,))
+    wide = plan(_topology(), _model((2,)), _workload(), _hardware(), objectives, evaluator,
+               ep_values=(1, 2))
+
+    narrow_ep1 = {r["candidate"].key: r["mean_tpot_ms"] for r in narrow.ranked}
+    wide_ep1 = {r["candidate"].key: r["mean_tpot_ms"] for r in wide.ranked
+               if r["candidate"].ffn_ep == 1}
+    assert narrow_ep1 == wide_ep1

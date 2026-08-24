@@ -33,6 +33,7 @@ from planner_core import (  # noqa: E402
     Topology, ModelSpec, Workload, Hardware, Objectives, Candidate,
     Rejection, Unknown, PlanResult, Evaluator,
     feasible_num_blocks, lane_assignment_feasible, enumerate_attn_shapes,
+    enumerate_joint_arrangements,
     attn_param_mem_bytes,
     plan as _core_plan,
 )
@@ -139,22 +140,25 @@ _RESULT_MARKER = "PLAN_EVAL_RESULT="
 
 
 def _placement_for(topology: Topology, deployment: Deployment, candidate: Candidate):
-    """`candidate.attn_shape`'s own reference `Placement` (from
-    `enumerate_attn_shapes`) was built for a unit deployment -- one
-    PREFILL, one DECODE_ATTN replica at this tp, one DECODE_FFN -- whose
-    ranks are, by construction, identical to this deployment's own
-    replica-0 ranks for each pool. Reused directly wherever a rank
-    matches (bit-identical to the reference for the base 1:1, ep=1 case,
-    matching task 32's own single-evaluation path exactly). Any rank the
-    reference does not cover -- additional replicas (replica-ratio
-    candidates) or additional expert-parallel ranks (ep > 1) -- is
-    packed into whatever domain slots the reference left free. Not
-    placement-optimal for those extra ranks; this project's placement
-    *search* is the shape dimension already covered by `attn_shape`, not
-    the replica/EP dimensions these confirmatory checks add on top.
+    """`(candidate.attn_shape, candidate.ep_shape)`'s own reference
+    `Placement` (from `enumerate_joint_arrangements`, task 44) was built
+    for a unit deployment -- one PREFILL, one DECODE_ATTN replica at
+    this tp, one DECODE_FFN replica at this ep -- whose ranks are, by
+    construction, identical to this deployment's own replica-0 ranks
+    for each pool. Reused directly wherever a rank matches (bit-identical
+    to the reference for the base 1:1 case, matching task 32's own
+    single-evaluation path exactly, and -- task 44's own extension --
+    for replica-0's own expert-parallel ranks too, not just its tensor-
+    parallel ones). Any rank the reference does not cover -- additional
+    replicas, from a `replica_ratios` candidate beyond replica 0 of
+    either pool -- is packed into whatever domain slots the reference
+    left free. Not placement-optimal for those extra ranks; task 41's
+    own established scope is the replica dimension, not this task's own
+    (expert placement within replica 0, which the joint reference now
+    covers directly).
     """
-    shapes = enumerate_attn_shapes(topology, candidate.attn_tp)
-    ref_placement = shapes[candidate.attn_shape]
+    joint = enumerate_joint_arrangements(topology, candidate.attn_tp, candidate.ffn_ep)
+    ref_placement = joint[(candidate.attn_shape, candidate.ep_shape)]
     fabric = topology.fabric
     domain_ids = sorted(fabric.domains)
 
@@ -184,7 +188,7 @@ def _placement_for(topology: Topology, deployment: Deployment, candidate: Candid
 
 
 def _run_scenario(topology_name: str, model_name: str, candidate_key: str,
-                  attn_tp: int, attn_shape: str, ffn_ep: int, ep_split: bool,
+                  attn_tp: int, attn_shape: str, ffn_ep: int, ep_shape: str,
                   attn_replicas: int, ffn_replicas: int, num_blocks: int,
                   memory_margin: float, num_requests: int, qps: float,
                   prefill_tokens: int, decode_tokens: int, device: str,
@@ -200,7 +204,8 @@ def _run_scenario(topology_name: str, model_name: str, candidate_key: str,
     workload = Workload(num_requests, qps, prefill_tokens, decode_tokens)
     hardware = Hardware(device, memory_margin)
     shape = tuple(int(x) for x in attn_shape.split(","))
-    candidate = Candidate(attn_tp, shape, ffn_ep, ep_split, attn_replicas, ffn_replicas)
+    ep_shape_t = tuple(int(x) for x in ep_shape.split(","))
+    candidate = Candidate(attn_tp, shape, ffn_ep, ep_shape_t, attn_replicas, ffn_replicas)
 
     d = Deployment("plan-eval")
     d.add(Replica(PoolKind.PREFILL, 0, tp=1))
@@ -279,7 +284,8 @@ def evaluate(topology: Topology, model: ModelSpec, workload: Workload, hardware:
          "--candidate-key", candidate.key,
          "--attn-tp", str(candidate.attn_tp),
          "--attn-shape", ",".join(map(str, candidate.attn_shape)),
-         "--ffn-ep", str(candidate.ffn_ep), "--ep-split", "1" if candidate.ep_split else "0",
+         "--ffn-ep", str(candidate.ffn_ep),
+         "--ep-shape", ",".join(map(str, candidate.ep_shape)),
          "--attn-replicas", str(candidate.attn_replicas), "--ffn-replicas", str(candidate.ffn_replicas),
          "--num-blocks", str(num_blocks), "--memory-margin", str(hardware.memory_margin_fraction),
          "--num-requests", str(workload.num_requests), "--qps", str(workload.qps),
@@ -476,7 +482,7 @@ if __name__ == "__main__":
     parser.add_argument("--attn-tp", type=int, default=None)
     parser.add_argument("--attn-shape", type=str, default=None)
     parser.add_argument("--ffn-ep", type=int, default=1)
-    parser.add_argument("--ep-split", type=int, default=0)
+    parser.add_argument("--ep-shape", type=str, default="1")
     parser.add_argument("--attn-replicas", type=int, default=1)
     parser.add_argument("--ffn-replicas", type=int, default=1)
     parser.add_argument("--num-blocks", type=int, default=None)
@@ -500,7 +506,7 @@ if __name__ == "__main__":
     if args.topology is not None:
         head_dim = None if args.head_dim == "none" else int(args.head_dim)
         _run_scenario(args.topology, args.model_name, args.candidate_key,
-                     args.attn_tp, args.attn_shape, args.ffn_ep, bool(args.ep_split),
+                     args.attn_tp, args.attn_shape, args.ffn_ep, args.ep_shape,
                      args.attn_replicas, args.ffn_replicas, args.num_blocks,
                      args.memory_margin, args.num_requests, args.qps,
                      args.prefill_tokens, args.decode_tokens, args.device,
