@@ -1,33 +1,23 @@
 #!/usr/bin/env python3
-"""Task 33: `plan(topology, model, workload, hardware, objectives) ->
-(tp, ep, replica_counts, placement, and why)` -- task 32's search,
-restructured so every input that changed the answer in principle is a
-genuine parameter of one call, not a constant inside a tool.
+"""Task 33's planner, evaluator half. `tools/planner_core.py` holds the
+search -- candidate representation, feasibility, shape enumeration,
+constraint filtering, ranking -- and knows nothing about Frontier. This
+module holds the only thing that does: `SimulationEvaluator`, which
+prices a candidate by invoking Frontier in a subprocess, plus the CLI
+entry point that subprocess actually runs.
 
 **Where this lives, and why.** Like every other real-compute
 orchestration tool in this project (`tools/run_placement_search.py`,
 `tools/seed_stats.py`, and everything since task 09), this needs to
 invoke Frontier to evaluate a candidate -- so it cannot live in
 `src/engine/` (which must never import `src/integration/` or
-`upstream/`) no matter how engine-shaped its own decision logic is.
-`Topology` wraps an `engine.physical.topology.Fabric` directly; nothing
-here reimplements what `Fabric`, `Deployment`, or Frontier's own model
-and workload configuration already provide -- this module makes them
-parameters of one function.
+`upstream/`) no matter how engine-shaped `planner_core`'s own decision
+logic is.
 
-**Search variables**: tensor-parallel degree, expert-parallel degree,
-replica counts (including the attention-to-FFN ratio), and physical
-placement, per this task's own S2. **Not search variables**: scheduler
-policy (its own benefit on realistic compute was never established --
-task 15's own report, "+0.00% -- noise, not an effect") and memory
-capacity (a feasibility filter per task 24/28/32, not an axis with a
-preference on it).
-
-**The test for "genuine parameter," not default-with-a-parameter's-name**
-(this task's own S7 trap): every one of `topology`, `model`, `workload`,
-`hardware`, `objectives` is varied across at least two calls somewhere
-in this task's own report, through this module's own public interface,
-with nothing in this file edited between them.
+`plan()` here is a thin wrapper over `planner_core.plan()` that defaults
+its `evaluator` argument to a fresh `SimulationEvaluator` -- the reason
+every call site from task 33/36 (which never pass an evaluator at all)
+keeps working unchanged (task 37's own acceptance requirement).
 """
 from __future__ import annotations
 
@@ -35,15 +25,20 @@ import json
 import statistics
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from planner_core import (  # noqa: E402
+    Topology, ModelSpec, Workload, Hardware, Objectives, Candidate,
+    Rejection, Unknown, PlanResult, Evaluator,
+    feasible_num_blocks, lane_assignment_feasible, enumerate_attn_shapes,
+    attn_param_mem_bytes,
+    plan as _core_plan,
+)
 from seed_stats import seed_argv_fix  # noqa: E402
-from engine.physical.topology import Fabric  # noqa: E402
-from engine.logical.deployment import Deployment, PoolKind, Replica, ParallelKind  # noqa: E402
-from engine.placement.placement import packed, spread, fragmented, explicit, PlacementError  # noqa: E402
+from engine.logical.deployment import Deployment, PoolKind, Replica  # noqa: E402
+from engine.placement.placement import explicit, PlacementError  # noqa: E402
 from engine.placement.binding import BindingPolicy  # noqa: E402
 from integration.cc_backend.comm_groups import CommGroupRegistry, populate_from_deployment  # noqa: E402
 from integration.context import BindingConfig  # noqa: E402
@@ -51,227 +46,6 @@ from integration.install import install  # noqa: E402
 
 FRONTIER_ROOT = Path("/work/simulation/Frontier")
 _SCRIPT_PATH = str(Path(__file__).resolve())
-
-# ---------------------------------------------------------------- inputs
-
-
-@dataclass
-class Topology:
-    """Machines, GPUs, NICs, scale-up domains, per-link bandwidth and
-    latency -- an `engine.physical.topology.Fabric`, named for reporting."""
-    fabric: Fabric
-    name: str
-
-
-@dataclass
-class ModelSpec:
-    """Hidden size, layers, attention kind, MoE-ness, and which
-    parallelism degrees are admissible -- most of this already lives in
-    Frontier's own model config JSON
-    (`data/config/models/<model_name>.json`); this names it and states
-    which degrees are worth searching, rather than re-deriving it."""
-    model_name: str
-    total_experts: int
-    router_topk: int
-    is_moe: bool
-    admissible_tp: Tuple[int, ...] = (1, 2, 4, 8)
-    admissible_ep: Tuple[int, ...] = (1,)
-    # Needed by `feasible_num_blocks` (below) to compute DECODE_ATTN's own
-    # parameter and KV-cache memory directly from Frontier's own formula
-    # (`param_counter.py`/`memory_planner.py`, verified bit-for-bit against
-    # Phi-tiny-MoE-instruct's own calibrated table in task 33/36) rather
-    # than a per-model lookup table. `head_dim=None` means "derive as
-    # hidden_size // num_attention_heads", matching
-    # `ModelConfig.get_head_dim()`'s own fallback -- only override it when
-    # the model's own JSON declares an explicit `head_dim` different from
-    # that (Phi-tiny-MoE-instruct does; Llama-3.1-405B-Instruct-FP8 does
-    # not, both confirmed by reading the JSON directly, not assumed).
-    hidden_size: int = 0
-    num_attention_heads: int = 0
-    num_key_value_heads: int = 0
-    num_layers: int = 0
-    head_dim: Optional[int] = None
-
-
-@dataclass
-class Workload:
-    """Prompt/output length (fixed, this project's own established
-    convention -- see task 31 report S1.3 for why that makes a plan
-    reproducible by construction), arrival rate, and concurrency."""
-    num_requests: int
-    qps: float
-    prefill_tokens: int
-    decode_tokens: int
-
-
-@dataclass
-class Hardware:
-    """Device compute profile and the usable-memory knob tasks 24-28
-    established as the only one Frontier actually exposes per cluster
-    (`memory_margin_fraction`; `gpu_memory_utilization` has no
-    per-cluster override, task 24's own finding)."""
-    device: str
-    memory_margin_fraction: float
-
-
-@dataclass
-class Objectives:
-    """Minimise `minimize`, subject to every constraint in `constraints`
-    passing. SLO and throughput are constraints, not reported-alongside
-    figures -- task 33's own S3: a constraint needs only pass/fail at a
-    threshold, which sidesteps exactly the tail-noise problem task 31
-    found (near a capacity edge, more seeds revealed more of the tail
-    rather than sharpening the estimate)."""
-    slo_tpot_ms: float
-    min_throughput_rps: float
-    minimize: str = "mean_tpot_ms"
-    slo_attainment_floor: float = 0.0  # 0.0 = SLO reported, not constrained
-
-
-@dataclass
-class Candidate:
-    attn_tp: int
-    attn_shape: Tuple[int, ...]
-    ffn_ep: int = 1
-    ep_split: bool = False
-    attn_replicas: int = 1
-    ffn_replicas: int = 1
-
-    @property
-    def key(self) -> str:
-        return (f"tp{self.attn_tp}_shape{'-'.join(map(str, self.attn_shape))}"
-               f"_ep{self.ffn_ep}{'s' if self.ep_split else ''}"
-               f"_ar{self.attn_replicas}_fr{self.ffn_replicas}")
-
-
-# ------------------------------------------------------ memory feasibility
-
-# Real device memory, in GB -- `frontier/config/device_sku_config.py`'s own
-# SKU table (task 35's own finding), not assumed.
-_DEVICE_MEMORY_GB = {
-    "a40": 45, "a100": 80, "a800": 80, "h100": 80, "h800": 80,
-    "h20": 96, "rtx_pro_6000": 96, "h200": 141, "mi355x": 288,
-}
-
-_KV_CACHE_BLOCK_SIZE = 16  # this project's own standing convention (tasks 22-33)
-_KV_FACTOR = 2  # DENSE_KV family (standard MHA/GQA, K+V) -- frontier/attention/families.py
-
-
-def _attn_head_dim(model: ModelSpec) -> int:
-    return model.head_dim if model.head_dim is not None else model.hidden_size // model.num_attention_heads
-
-
-def attn_param_mem_bytes(model: ModelSpec, attn_tp: int) -> int:
-    """DECODE_ATTN's own per-device parameter memory at this `attn_tp`,
-    computed directly from `frontier/utils/param_counter.py`'s own
-    formula (Q/K/V/O only -- DECODE_FFN's MLP/MoE weights are a separate
-    cluster's memory, task 35's own S0 scoping point) and
-    `frontier/scheduler/utils/memory_planner.py`'s own unconditional
-    2-bytes/param assumption. Verified bit-for-bit against
-    `ParamCounter.get_num_parameters_per_device()` for both
-    Phi-tiny-MoE-instruct (671088640/335544320/167772160/100663296 params
-    at tp=1/2/4/8) and Llama-3.1-405B-Instruct-FP8
-    (71873593344/35936796672/17968398336/8984199168/4756340736/2642411520
-    at tp=1/2/4/8/16/32) before use, not assumed from a formula alone."""
-    head_dim = _attn_head_dim(model)
-    q_per_worker = model.num_attention_heads / attn_tp
-    kv_per_worker = -(-model.num_key_value_heads // attn_tp)  # ceil
-    per_layer = (model.hidden_size * head_dim * (q_per_worker + 2 * kv_per_worker)
-                + model.hidden_size * head_dim * q_per_worker)
-    return int(2 * per_layer * model.num_layers)
-
-
-def _kv_cache_page_bytes_per_layer(model: ModelSpec, attn_tp: int, block_size: int) -> int:
-    """`frontier/scheduler/utils/memory_planner.py`'s own
-    `_get_kv_cache_memory_per_layer_per_block`: 2 bytes/element x
-    block_size x kv_factor x kv_heads_per_worker x head_dim."""
-    head_dim = _attn_head_dim(model)
-    kv_per_worker = -(-model.num_key_value_heads // attn_tp)
-    return 2 * block_size * _KV_FACTOR * kv_per_worker * head_dim
-
-
-def feasible_num_blocks(model: ModelSpec, hardware: Hardware, attn_tp: int) -> Optional[int]:
-    """`None` if infeasible (parameter memory alone exceeds the usable
-    budget at this margin); otherwise the derived `num_blocks`, from
-    `frontier/scheduler/utils/memory_planner.py`'s own `get_num_blocks`
-    formula: `available_kv_cache_memory // page_size // num_layers`,
-    `available_kv_cache_memory = requested_memory - parameter_memory`."""
-    if model.num_attention_heads <= 0 or model.hidden_size <= 0 or model.num_layers <= 0:
-        raise ValueError(
-            f"ModelSpec({model.model_name!r}) is missing hidden_size/"
-            "num_attention_heads/num_key_value_heads/num_layers -- "
-            "feasible_num_blocks needs them to compute DECODE_ATTN's own "
-            "memory directly, not a per-model lookup table.")
-    device_bytes = _DEVICE_MEMORY_GB[hardware.device] * 1024 ** 3
-    requested_memory = int(device_bytes * (1 - hardware.memory_margin_fraction))
-    param_mem = attn_param_mem_bytes(model, attn_tp)
-    avail = requested_memory - param_mem
-    if avail <= 0:
-        return None
-    page_size = _kv_cache_page_bytes_per_layer(model, attn_tp, _KV_CACHE_BLOCK_SIZE)
-    num_blocks = avail // page_size // model.num_layers
-    return int(num_blocks) if num_blocks > 0 else None
-
-
-def lane_assignment_feasible(attn_replicas: int, ffn_replicas: int, attn_dp_size: int) -> bool:
-    """Task 22's own mechanical finding: Frontier's static M2N lane
-    assignment needs `attn_replicas * attn_dp_size >= ffn_replicas`, or it
-    raises. Not a preference -- a hard constraint on the (attn_replicas,
-    ffn_replicas, attn_dp_size) triple."""
-    return attn_replicas * attn_dp_size >= ffn_replicas
-
-
-# --------------------------------------------------------- candidate generation
-
-
-def enumerate_attn_shapes(topology: Topology, attn_tp: int,
-                          n_fragmented_seeds: int = 60) -> Dict[Tuple[int, ...], object]:
-    """Every distinct `group_shape()` reachable for a single DECODE_ATTN
-    replica's own TP group on `topology.fabric`, via this project's own
-    existing placement policies -- task 32's own method, reused
-    unchanged, parameterised on the fabric instead of a module constant."""
-    fabric = topology.fabric
-    d = Deployment("shape-probe")
-    d.add(Replica(PoolKind.PREFILL, 0, tp=1))
-    d.add(Replica(PoolKind.DECODE_ATTN, 0, tp=attn_tp))
-    d.add(Replica(PoolKind.DECODE_FFN, 0, tp=1))
-    group = d.replicas[1].groups(ParallelKind.TP)[0] if attn_tp > 1 else None
-
-    candidates = []
-    for policy in (packed, spread):
-        try:
-            candidates.append(policy(d, fabric))
-        except Exception:  # noqa: BLE001
-            pass
-    domain_size = min(len(dom.members) for dom in fabric.domains.values())
-    if attn_tp <= domain_size and attn_tp > 1:
-        prefill_rank = d.replicas[0].ranks[0]
-        ffn_rank = d.replicas[2].ranks[0]
-        domain_ids = sorted(fabric.domains)
-        attn_domain_members = sorted(fabric.domains[domain_ids[1]].members)
-        other_domain_members = sorted(fabric.domains[domain_ids[0]].members)
-        mapping = {prefill_rank: other_domain_members[0], ffn_rank: other_domain_members[1]}
-        for i, r in enumerate(group.ranks):
-            mapping[r] = attn_domain_members[i]
-        try:
-            candidates.append(explicit(d, fabric, mapping))
-        except Exception:  # noqa: BLE001
-            pass
-    for seed in range(n_fragmented_seeds):
-        try:
-            candidates.append(fragmented(d, fabric, seed=seed))
-        except Exception:  # noqa: BLE001
-            pass
-
-    if attn_tp == 1:
-        return {(1,): candidates[0]} if candidates else {}
-
-    shapes = {}
-    for p in candidates:
-        shape = p.group_shape(group)
-        if shape not in shapes:
-            shapes[shape] = p
-    return shapes
 
 
 # --------------------------------------------------------------- evaluation
@@ -384,7 +158,7 @@ def _placement_for(topology: Topology, deployment: Deployment, candidate: Candid
     fabric = topology.fabric
     domain_ids = sorted(fabric.domains)
 
-    mapping: Dict = {}
+    mapping: dict = {}
     occupied = set()
     for replica in deployment.replicas:
         for r in replica.ranks:
@@ -490,6 +264,15 @@ def _run_scenario(topology_name: str, model_name: str, candidate_key: str,
 
 def evaluate(topology: Topology, model: ModelSpec, workload: Workload, hardware: Hardware,
             candidate: Candidate, num_blocks: int, seed: int = 0, seeded: bool = False) -> dict:
+    """Runs one candidate through Frontier in a subprocess and returns
+    its result dict. Kept as a free function, not folded into
+    `SimulationEvaluator` alone, because seeded re-runs (tasks 31-36's
+    own established method) need `seed`/`seeded`, which the `Evaluator`
+    protocol's own `evaluate(candidate)` deliberately does not carry --
+    a seed is a property of *how* a simulator is asked to run, not of
+    the candidate itself, and a telemetry evaluator has no seed concept
+    at all. `SimulationEvaluator.evaluate` calls this with `seed=0,
+    seeded=False`, task 31/32's own established deterministic policy."""
     proc = subprocess.run(
         [sys.executable, _SCRIPT_PATH,
          "--topology", topology.name, "--model-name", model.model_name,
@@ -518,74 +301,47 @@ def evaluate(topology: Topology, model: ModelSpec, workload: Workload, hardware:
     return {"error": f"no result (exit code {proc.returncode})", "key": candidate.key}
 
 
-# ------------------------------------------------------------------- plan()
+class SimulationEvaluator:
+    """The only `Evaluator` this project has: prices a candidate by
+    running Frontier in a subprocess. Bound to one
+    topology/model/workload/hardware at construction, matching the scope
+    one `plan()` call already fixes them to.
 
+    `can_evaluate` answers from `model.profiled_tp` -- Task 35's own
+    finding that every model in this checkout, on every device with
+    real profiles, is profiled at tp in {1,2,4,8} only, because nobody
+    overrode the profiler's own default sweep
+    (`frontier/profiling/linear_op/main.py`'s own
+    `--num_tensor_parallel_workers`, default `[1,2,4,8]`). This is a
+    real, current limit, not speculative scaffolding: a candidate at
+    tp=16 is not rejected by this evaluator, it is *unknown* to it --
+    `plan()` keeps that distinct (task 37's own known trap).
+    """
 
-@dataclass
-class Rejection:
-    candidate_key: str
-    reason: str
+    def __init__(self, topology: Topology, model: ModelSpec, workload: Workload, hardware: Hardware):
+        self.topology = topology
+        self.model = model
+        self.workload = workload
+        self.hardware = hardware
 
+    def can_evaluate(self, candidate: Candidate) -> bool:
+        return candidate.attn_tp in self.model.profiled_tp
 
-@dataclass
-class PlanResult:
-    winner: Optional[dict]
-    ranked: List[dict]
-    rejections: List[Rejection]
+    def evaluate(self, candidate: Candidate) -> dict:
+        num_blocks = feasible_num_blocks(self.model, self.hardware, candidate.attn_tp)
+        return evaluate(self.topology, self.model, self.workload, self.hardware,
+                        candidate, num_blocks, seed=0, seeded=False)
 
 
 def plan(topology: Topology, model: ModelSpec, workload: Workload, hardware: Hardware,
-         objectives: Objectives, *, attn_tp_values: Tuple[int, ...] = None,
-         ep_values: Tuple[int, ...] = None,
-         replica_ratios: Tuple[Tuple[int, int], ...] = ((1, 1),)) -> PlanResult:
-    """Generate candidates over `attn_tp_values` (default:
-    `model.admissible_tp`) x placement shape (per `topology`) x
-    `ep_values` (default: `model.admissible_ep`) x `replica_ratios`,
-    reject infeasible ones up front, evaluate the rest once each
-    (deterministic configuration, task 31 report S1.3 -- task 33's own
-    S1 seed policy), and rank the survivors by `objectives.minimize`
-    among those meeting every constraint.
-    """
-    attn_tp_values = attn_tp_values or model.admissible_tp
-    ep_values = ep_values or model.admissible_ep
-
-    rejections: List[Rejection] = []
-    evaluated: List[dict] = []
-
-    for attn_tp in attn_tp_values:
-        num_blocks = feasible_num_blocks(model, hardware, attn_tp)
-        if num_blocks is None:
-            rejections.append(Rejection(f"tp{attn_tp}_*", "memory: infeasible at this margin"))
-            continue
-        shapes = enumerate_attn_shapes(topology, attn_tp)
-        for shape in shapes:
-            for ep in ep_values:
-                for attn_replicas, ffn_replicas in replica_ratios:
-                    if not lane_assignment_feasible(attn_replicas, ffn_replicas, ffn_replicas):
-                        rejections.append(Rejection(
-                            f"tp{attn_tp}_shape{shape}_ep{ep}_ar{attn_replicas}_fr{ffn_replicas}",
-                            "lane assignment: attn_replicas*attn_dp_size < ffn_replicas"))
-                        continue
-                    candidate = Candidate(attn_tp, shape, ep, False, attn_replicas, ffn_replicas)
-                    r = evaluate(topology, model, workload, hardware, candidate, num_blocks)
-                    if r.get("error"):
-                        rejections.append(Rejection(candidate.key, f"evaluation error: {r['error']}"))
-                        continue
-                    r["candidate"] = candidate
-                    if r["throughput_rps"] < objectives.min_throughput_rps:
-                        rejections.append(Rejection(candidate.key,
-                            f"throughput floor: {r['throughput_rps']:.3f} < {objectives.min_throughput_rps}"))
-                        continue
-                    if r["slo_attainment"] < objectives.slo_attainment_floor - 1e-9:
-                        rejections.append(Rejection(candidate.key,
-                            f"SLO: attainment {r['slo_attainment']:.3f} below required "
-                            f"{objectives.slo_attainment_floor}"))
-                        continue
-                    evaluated.append(r)
-
-    evaluated.sort(key=lambda r: r[objectives.minimize])
-    winner = evaluated[0] if evaluated else None
-    return PlanResult(winner=winner, ranked=evaluated, rejections=rejections)
+        objectives: Objectives, evaluator: Optional[Evaluator] = None, **kwargs) -> PlanResult:
+    """`planner_core.plan()`, defaulting `evaluator` to a fresh
+    `SimulationEvaluator` bound to this call's own
+    topology/model/workload/hardware -- the reason every call site from
+    tasks 33/36 (none of which pass an evaluator) reproduces unchanged."""
+    if evaluator is None:
+        evaluator = SimulationEvaluator(topology, model, workload, hardware)
+    return _core_plan(topology, model, workload, hardware, objectives, evaluator, **kwargs)
 
 
 # ------------------------------------------------------------ topologies
