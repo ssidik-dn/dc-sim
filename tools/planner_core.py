@@ -29,7 +29,7 @@ would misrepresent what it is for.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Protocol, Tuple, runtime_checkable
+from typing import Callable, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 from engine.physical.topology import Fabric
 from engine.logical.deployment import Deployment, PoolKind, Replica, ParallelKind
@@ -376,6 +376,26 @@ def lane_assignment_feasible(attn_replicas: int, ffn_replicas: int, attn_dp_size
     return attn_replicas * attn_dp_size >= ffn_replicas
 
 
+def default_attn_dp_size_policy(attn_replicas: int, ffn_replicas: int) -> int:
+    """Task 32 S7's own open question -- "search [attn_dp_size] jointly or
+    fix a policy for setting it per candidate ratio, not carry over this
+    task's own fixed value [of 1]" -- resolved the same way
+    `tools/planner.py`'s own `_argv` already resolves it (task 33):
+    `attn_dp_size := max(ffn_replicas, 1)`, the smallest fixed choice that
+    satisfies `lane_assignment_feasible` for every `attn_replicas >= 1`
+    unconditionally (`attn_replicas * ffn_replicas >= ffn_replicas` holds
+    whenever `attn_replicas >= 1`) -- so under this policy the lane check
+    below can never actually be the reason a candidate is inadmissible;
+    that outcome is reported plainly in task 41's own report, not hidden.
+
+    Kept as an explicit, overridable policy (not inlined into `plan()`)
+    for exactly the reason task 32 S7 named it as an open design
+    question: a caller that wants to see the lane check actually bind --
+    or a future evaluator with a different dp_size story -- can pass a
+    different one without `plan()` itself changing."""
+    return max(ffn_replicas, 1)
+
+
 # --------------------------------------------------------- candidate generation
 
 
@@ -436,6 +456,73 @@ def enumerate_attn_shapes(topology: Topology, attn_tp: int,
     return shapes
 
 
+def enumerate_replica_arrangements(topology: Topology, attn_tp: int, attn_replicas: int,
+                                   ffn_replicas: int = 1,
+                                   n_fragmented_seeds: int = 60
+                                   ) -> Dict[Tuple[Tuple[int, ...], ...], object]:
+    """Task 41's own extension of `enumerate_attn_shapes` to more than one
+    replica of a pool: every distinct *arrangement* of `attn_replicas`
+    DECODE_ATTN replicas (each its own TP group of degree `attn_tp`)
+    reachable on `topology.fabric`, via this project's own existing
+    placement policies applied to the FULL multi-replica deployment at
+    once -- so a raw candidate reflects whether the fabric has room for
+    every replica simultaneously, not `_placement_for`'s own simpler
+    single-reference-then-pack-leftovers fallback (`tools/planner.py`,
+    task 33).
+
+    Deduplicated as a **multiset**, not a tuple: replicas of the same
+    pool are interchangeable (`AGENTS.md`'s own `group_shape()`
+    invariant, extended here across replicas rather than only within one
+    group's own ranks) -- an arrangement assigning shapes `{A, B}` to two
+    attention replicas is the identical arrangement to `{B, A}`, so the
+    canonical key sorts the per-replica shapes before using them, the
+    same principle `group_shape()` itself applies to one group's own
+    per-domain counts.
+
+    `ffn_replicas` (always tp=1 in this project's own convention; task
+    41's own known trap explicitly excludes searching FFN's own EP/TP
+    placement here) still occupies real ranks and real GPUs, so it
+    affects how much room is left for ATTN's own replicas on a shared
+    fabric -- but contributes no shape choice of its own, so only the
+    ATTN multiset is the key.
+
+    Pure `engine.placement`/`engine.logical`, no Frontier -- this
+    enumerates the *space*, exactly `enumerate_attn_shapes`'s own
+    purpose, not a priced result."""
+    fabric = topology.fabric
+    d = Deployment("replica-arrangement-probe")
+    d.add(Replica(PoolKind.PREFILL, 0, tp=1))
+    for i in range(attn_replicas):
+        d.add(Replica(PoolKind.DECODE_ATTN, i, tp=attn_tp))
+    for i in range(ffn_replicas):
+        d.add(Replica(PoolKind.DECODE_FFN, i, tp=1))
+
+    attn_groups = ([r.groups(ParallelKind.TP)[0] for r in d.pool(PoolKind.DECODE_ATTN)]
+                  if attn_tp > 1 else [])
+
+    candidates = []
+    for policy in (packed, spread):
+        try:
+            candidates.append(policy(d, fabric))
+        except Exception:  # noqa: BLE001
+            pass
+    for seed in range(n_fragmented_seeds):
+        try:
+            candidates.append(fragmented(d, fabric, seed=seed))
+        except Exception:  # noqa: BLE001
+            pass
+
+    arrangements: Dict[Tuple[Tuple[int, ...], ...], object] = {}
+    for p in candidates:
+        if attn_tp == 1:
+            sig = tuple([(1,)] * attn_replicas)
+        else:
+            sig = tuple(sorted((p.group_shape(g) for g in attn_groups)))
+        if sig not in arrangements:
+            arrangements[sig] = p
+    return arrangements
+
+
 # ------------------------------------------------------------------- plan()
 
 
@@ -459,17 +546,20 @@ class Unknown:
 
 @dataclass
 class Inadmissible:
-    """A candidate degree that does not evenly divide this model's own
-    structure -- `attn_tp` doesn't divide `num_attention_heads`, or
-    `hidden_size` doesn't divide by `attn_tp` or by `num_attention_heads`
-    (task 39 Part A). Distinct from both `Rejection` (a property of
-    hardware/memory at a given margin) and `Unknown` (a gap in one
-    evaluator's own coverage): this is a property of the (model, degree)
-    *request* alone, true regardless of hardware, margin, or which
-    evaluator `plan()` was given. This project's own known trap: a
-    degree that cannot divide the model is not infeasible on memory and
-    not a constraint failure -- reporting it as either would attribute
-    a property of the request to the hardware or the evaluator instead."""
+    """A candidate that cannot exist as requested, independent of
+    hardware, margin, or which evaluator `plan()` was given -- either a
+    degree that does not evenly divide this model's own structure
+    (`attn_tp` doesn't divide `num_attention_heads`, or `hidden_size`
+    doesn't divide by `attn_tp` or by `num_attention_heads`, task 39
+    Part A), or a (attn_replicas, ffn_replicas, attn_dp_size) triple that
+    violates Frontier's own static M2N lane-assignment requirement
+    (task 22's own finding, task 41's own extension: `attn_replicas *
+    attn_dp_size >= ffn_replicas`, checked via `lane_assignment_feasible`
+    before any candidate is even constructed). Distinct from both
+    `Rejection` (a property of hardware/memory at a given margin) and
+    `Unknown` (a gap in one evaluator's own coverage): this project's own
+    known trap is attributing a property of the request itself to the
+    hardware or the evaluator instead."""
     candidate_key: str
     reason: str
 
@@ -486,7 +576,8 @@ class PlanResult:
 def plan(topology: Topology, model: ModelSpec, workload: Workload, hardware: Hardware,
         objectives: Objectives, evaluator: Evaluator, *, attn_tp_values: Tuple[int, ...] = None,
         ep_values: Tuple[int, ...] = None,
-        replica_ratios: Tuple[Tuple[int, int], ...] = ((1, 1),)) -> PlanResult:
+        replica_ratios: Tuple[Tuple[int, int], ...] = ((1, 1),),
+        attn_dp_size_policy: Callable[[int, int], int] = default_attn_dp_size_policy) -> PlanResult:
     """Generate candidates over `attn_tp_values` (default:
     `model.admissible_tp`) x placement shape (per `topology`) x
     `ep_values` (default: `model.admissible_ep`) x `replica_ratios`,
@@ -499,6 +590,18 @@ def plan(topology: Topology, model: ModelSpec, workload: Workload, hardware: Har
     nothing about Frontier, so it cannot name a default. `tools/planner.py`'s
     own `plan()` wraps this one with `SimulationEvaluator()` as the
     default, which is what keeps every existing call site unchanged.
+
+    `replica_ratios` defaults to `((1, 1),)` -- every call site from
+    tasks 32/33/36 (which never pass it) reproduces bit-identically,
+    since a single (1, 1) ratio is exactly what every one of those
+    searches already assumed implicitly. Task 41's own extension: a
+    caller that passes more ratios gets each checked against
+    `lane_assignment_feasible` (via `attn_dp_size_policy`, task 32 S7's
+    own open design question) *before* a `Candidate` is even built --
+    a violation is `Inadmissible`, not a `Rejection`, since it is a
+    property of the (attn_replicas, ffn_replicas, attn_dp_size) triple
+    itself, true for every evaluator and every hardware margin, exactly
+    the distinction task 39 drew for a non-dividing `attn_tp`.
     """
     attn_tp_values = attn_tp_values or model.admissible_tp
     ep_values = ep_values or model.admissible_ep
@@ -521,10 +624,12 @@ def plan(topology: Topology, model: ModelSpec, workload: Workload, hardware: Har
         for shape in shapes:
             for ep in ep_values:
                 for attn_replicas, ffn_replicas in replica_ratios:
-                    if not lane_assignment_feasible(attn_replicas, ffn_replicas, ffn_replicas):
-                        rejections.append(Rejection(
+                    attn_dp_size = attn_dp_size_policy(attn_replicas, ffn_replicas)
+                    if not lane_assignment_feasible(attn_replicas, ffn_replicas, attn_dp_size):
+                        inadmissible.append(Inadmissible(
                             f"tp{attn_tp}_shape{shape}_ep{ep}_ar{attn_replicas}_fr{ffn_replicas}",
-                            "lane assignment: attn_replicas*attn_dp_size < ffn_replicas"))
+                            f"lane assignment: attn_replicas({attn_replicas})*attn_dp_size"
+                            f"({attn_dp_size}) < ffn_replicas({ffn_replicas})"))
                         continue
                     candidate = Candidate(attn_tp, shape, ep, False, attn_replicas, ffn_replicas)
                     if not evaluator.can_evaluate(candidate):

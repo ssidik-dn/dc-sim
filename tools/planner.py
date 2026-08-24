@@ -316,6 +316,36 @@ class SimulationEvaluator:
     real, current limit, not speculative scaffolding: a candidate at
     tp=16 is not rejected by this evaluator, it is *unknown* to it --
     `plan()` keeps that distinct (task 37's own known trap).
+
+    Task 41's own verified finding, added here for the same reason:
+    this evaluator cannot price `attn_replicas > 1` at any admissible
+    `attn_tp` (every one of them is > 1 -- tp=1 is memory-infeasible for
+    every model this project's tasks 32-40 have used) -- confirmed by
+    running it, not assumed from reading the code:
+    `populate_from_deployment` registers each DECODE_ATTN replica's own
+    TP group under the SAME `(cluster_type, comm_domain, num_devices)`
+    key (`src/integration/cc_backend/comm_groups.py`'s own docstring:
+    "Frontier's cc_backend calls carry a device count and a
+    parallelism-domain label -- never a rank identity"), so a second
+    replica at the same `attn_tp` collides and
+    `CommGroupRegistry.register` raises `CommGroupError`. This is a
+    real limit of *this* evaluator's own pipeline, not of the (model,
+    degree, ratio) request or of available memory -- exactly what
+    `can_evaluate() -> False` (Unknown) exists to report, matching
+    task 37's own two-methods design. A different evaluator (one that
+    does not route DECODE_ATTN's own TP cost through
+    `CommGroupRegistry`, or a telemetry-backed one observing an
+    already-running multi-replica deployment) would not necessarily
+    share this limit.
+
+    `ffn_replicas > 1` is, despite first appearances, NOT similarly
+    restricted -- an earlier version of this finding believed it was,
+    from a probe that ran several evaluations in one Python process and
+    was fooled by cross-call state leakage into seeing a crash that a
+    single, isolated run does not reproduce (task 41's own report,
+    S5, explains the mistake and how it was caught). Confirmed clean,
+    one subprocess per candidate, at `ffn_replicas` up to 16: this
+    evaluator prices it exactly like any other candidate.
     """
 
     def __init__(self, topology: Topology, model: ModelSpec, workload: Workload, hardware: Hardware):
@@ -325,7 +355,7 @@ class SimulationEvaluator:
         self.hardware = hardware
 
     def can_evaluate(self, candidate: Candidate) -> bool:
-        return candidate.attn_tp in self.model.profiled_tp
+        return candidate.attn_tp in self.model.profiled_tp and candidate.attn_replicas == 1
 
     def evaluate(self, candidate: Candidate) -> dict:
         num_blocks = feasible_num_blocks(self.model, self.hardware, candidate.attn_tp)

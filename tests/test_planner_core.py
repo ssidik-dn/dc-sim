@@ -32,6 +32,8 @@ from planner_core import (  # noqa: E402
     Topology, ModelSpec, Workload, Hardware, Objectives, Candidate, plan,
     divisibility_violations, attn_param_mem_bytes, InadmissibleDegree,
     _kv_cache_page_bytes_per_layer,
+    lane_assignment_feasible, default_attn_dp_size_policy,
+    enumerate_replica_arrangements,
 )
 from engine.physical.builders import build_node_scale  # noqa: E402
 
@@ -304,3 +306,175 @@ def test_kv_cache_page_bytes_uses_the_override_when_the_raw_fields_would_be_wron
     assert raw_page_bytes > corrected_page_bytes
     ratio = raw_page_bytes / corrected_page_bytes
     assert 12.0 < ratio < 12.5
+
+
+# ------------------------------------------------- Task 41: replica ratio search
+
+
+def test_default_attn_dp_size_policy_matches_the_argv_convention():
+    """`tools/planner.py`'s own `_argv` sets `attn_data_parallel_size =
+    max(candidate.ffn_replicas, 1)` -- this is the SAME formula, kept as
+    an explicit, named, overridable policy (task 32 S7's own open
+    design question) rather than duplicated inline."""
+    assert default_attn_dp_size_policy(1, 1) == 1
+    assert default_attn_dp_size_policy(1, 5) == 5
+    assert default_attn_dp_size_policy(3, 0) == 1
+
+
+def test_lane_assignment_feasible_matches_frontiers_own_requirement():
+    # 1 attn replica, dp_size=1 lane, cannot cover 2 ffn replicas.
+    assert lane_assignment_feasible(1, 2, 1) is False
+    # 1 attn replica, dp_size=2 lanes, covers 2 ffn replicas exactly.
+    assert lane_assignment_feasible(1, 2, 2) is True
+    # 2 attn replicas, dp_size=1 (2 lanes total), covers 2 ffn replicas.
+    assert lane_assignment_feasible(2, 2, 1) is True
+
+
+class ReplicaAwareFakeEvaluator(FakeEvaluator):
+    """Unlike `FakeEvaluator` (which "ignores... replica ratio
+    deliberately"), this one prices only `attn_replicas == 1` --
+    matching `SimulationEvaluator.can_evaluate`'s own task 41 finding
+    (confirmed by running it: `attn_replicas > 1` collides in
+    `CommGroupRegistry`; `ffn_replicas > 1` does not, and is priced
+    normally), so a test against it exercises the same Unknown path a
+    real run would hit for `attn_replicas > 1`, without needing
+    Frontier."""
+
+    def can_evaluate(self, candidate: Candidate) -> bool:
+        return super().can_evaluate(candidate) and candidate.attn_replicas == 1
+
+
+def test_plan_reports_lane_violation_as_inadmissible_not_rejected():
+    """Task 41's own acceptance requirement: a lane-assignment violation
+    must surface as `Inadmissible` (task 39's sense), never as a
+    `Rejection` -- and the evaluator must never be consulted about it,
+    exactly like a non-dividing `attn_tp`. Forces the violation with an
+    explicit `attn_dp_size_policy` that always returns 1 (rather than
+    this project's own default, `max(ffn_replicas, 1)`, under which the
+    check can never actually fire -- task 41's own report explains why)."""
+    asked = []
+
+    class RecordingEvaluator(ReplicaAwareFakeEvaluator):
+        def can_evaluate(self, candidate):
+            asked.append(candidate.key)
+            return super().can_evaluate(candidate)
+
+    evaluator = RecordingEvaluator({
+        2: {"mean_tpot_ms": 10.0, "throughput_rps": 100.0, "slo_attainment": 0.9},
+    })
+    objectives = Objectives(slo_tpot_ms=15.0, min_throughput_rps=0.0, minimize="mean_tpot_ms")
+
+    result = plan(_topology(), _model((2,)), _workload(), _hardware(), objectives, evaluator,
+                 replica_ratios=((1, 1), (1, 2)), attn_dp_size_policy=lambda ar, fr: 1)
+
+    violating = [i for i in result.inadmissible if "_fr2" in i.candidate_key]
+    assert violating, "the (1, 2) ratio at attn_dp_size=1 must be inadmissible"
+    assert "lane assignment" in violating[0].reason
+    assert not any("_fr2" in r.candidate_key for r in result.rejections)
+    assert not any("_fr2" in u.candidate_key for u in result.unknown)
+    assert not any("_fr2" in key for key in asked), \
+        "a lane-inadmissible candidate must never reach the evaluator"
+    assert result.winner["candidate"].ffn_replicas == 1
+
+
+def test_plan_restricted_to_1to1_matches_the_unextended_search():
+    """Task 41's own cleanest proof that the extension is an extension:
+    a search that only ever considers the (1, 1) ratio (explicitly, or
+    by leaving `replica_ratios` at its default) must produce exactly the
+    same result either way."""
+    objectives = Objectives(slo_tpot_ms=15.0, min_throughput_rps=0.0, minimize="mean_tpot_ms")
+    evaluator = ReplicaAwareFakeEvaluator({
+        1: {"mean_tpot_ms": 20.0, "throughput_rps": 50.0, "slo_attainment": 0.5},
+        2: {"mean_tpot_ms": 10.0, "throughput_rps": 100.0, "slo_attainment": 0.9},
+    })
+
+    default_result = plan(_topology(), _model((1, 2)), _workload(), _hardware(),
+                          objectives, evaluator)
+    explicit_result = plan(_topology(), _model((1, 2)), _workload(), _hardware(),
+                           objectives, evaluator, replica_ratios=((1, 1),))
+
+    assert [r["candidate"].key for r in default_result.ranked] == \
+        [r["candidate"].key for r in explicit_result.ranked]
+    assert [r["mean_tpot_ms"] for r in default_result.ranked] == \
+        [r["mean_tpot_ms"] for r in explicit_result.ranked]
+    assert default_result.winner["candidate"].key == explicit_result.winner["candidate"].key
+
+
+def test_plan_adding_more_ratios_does_not_perturb_the_1to1_candidates():
+    """Adding `replica_ratios` beyond the default must not change what
+    the (1, 1) candidates themselves evaluate to -- task 41's own known
+    trap, phrased as acceptance: the new dimension extends the search,
+    it does not affect the old default."""
+    objectives = Objectives(slo_tpot_ms=15.0, min_throughput_rps=0.0, minimize="mean_tpot_ms")
+    evaluator = ReplicaAwareFakeEvaluator({
+        1: {"mean_tpot_ms": 20.0, "throughput_rps": 50.0, "slo_attainment": 0.5},
+        2: {"mean_tpot_ms": 10.0, "throughput_rps": 100.0, "slo_attainment": 0.9},
+    })
+
+    narrow = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives, evaluator,
+                 replica_ratios=((1, 1),))
+    wide = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives, evaluator,
+               replica_ratios=((1, 1), (2, 1), (1, 2), (3, 2)))
+
+    narrow_1to1 = {r["candidate"].key: r["mean_tpot_ms"] for r in narrow.ranked}
+    wide_1to1 = {r["candidate"].key: r["mean_tpot_ms"] for r in wide.ranked
+                if r["candidate"].attn_replicas == 1 and r["candidate"].ffn_replicas == 1}
+    assert narrow_1to1 == wide_1to1
+    assert wide.winner["candidate"].key == narrow.winner["candidate"].key
+    # every non-(1,1) candidate the wider search considered is Unknown to
+    # this evaluator, not silently dropped or miscounted as a rejection.
+    assert any(u.candidate_key for u in wide.unknown
+              if "_ar2" in u.candidate_key or "_fr2" in u.candidate_key)
+
+
+# ---------------------------------------- enumerate_replica_arrangements (task 41)
+
+
+def _wide_topology():
+    """8 GPUs, 2 domains of 4 -- enough room for 2 attention replicas at
+    attn_tp=2 (4 GPUs) plus one PREFILL and one DECODE_FFN rank."""
+    fabric = build_node_scale(num_machines=2, gpus_per_machine=4)
+    return Topology(fabric, "wide-test-fabric")
+
+
+def test_enumerate_replica_arrangements_single_replica_matches_enumerate_attn_shapes():
+    """At `attn_replicas=1`, the multiset-of-one signature must carry
+    exactly the same information `enumerate_attn_shapes` already
+    reports -- the extension must agree with the un-extended case it
+    generalises, not merely resemble it."""
+    from planner_core import enumerate_attn_shapes
+    topology = _wide_topology()
+    single = enumerate_attn_shapes(topology, attn_tp=2)
+    multi = enumerate_replica_arrangements(topology, attn_tp=2, attn_replicas=1)
+    assert set(multi.keys()) == {(shape,) for shape in single.keys()}
+
+
+def test_enumerate_replica_arrangements_collapses_permutations():
+    """Two attention replicas at attn_tp=2 on an 8-GPU, 2-domain fabric:
+    each replica's own shape is (2,) or (1,1) (`enumerate_attn_shapes`'s
+    own S=2 result at this degree), so raw placements collapse to at
+    most 3 distinct multisets -- {(2,),(2,)}, {(2,),(1,1)},
+    {(1,1),(1,1)} -- never 4, which is what an *ordered*-pair signature
+    (not treating the two replicas as interchangeable) would allow."""
+    topology = _wide_topology()
+    arrangements = enumerate_replica_arrangements(topology, attn_tp=2, attn_replicas=2,
+                                                  n_fragmented_seeds=60)
+    assert len(arrangements) <= 3
+    for sig in arrangements:
+        assert sig == tuple(sorted(sig)), \
+            f"signature {sig} is not in canonical (sorted) multiset form"
+
+
+def test_enumerate_replica_arrangements_treats_swapped_shapes_as_one_arrangement():
+    """The literal case task 41's own spec names: a placement giving
+    {A, B} to two replicas must key identically to one giving {B, A}."""
+    topology = _wide_topology()
+    arrangements = enumerate_replica_arrangements(topology, attn_tp=2, attn_replicas=2,
+                                                  n_fragmented_seeds=60)
+    # tuple-sort orders (1, 1) before (2,) lexicographically -- the mixed
+    # arrangement (one replica packed, one split) has exactly one
+    # canonical key, however many raw placements produced it either way.
+    mixed_keys = [sig for sig in arrangements if set(sig) == {(2,), (1, 1)}]
+    assert len(mixed_keys) <= 1
+    if mixed_keys:
+        assert mixed_keys[0] == ((1, 1), (2,))
