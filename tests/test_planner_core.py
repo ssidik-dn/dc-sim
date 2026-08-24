@@ -24,10 +24,14 @@ import ast
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 from planner_core import (  # noqa: E402
     Topology, ModelSpec, Workload, Hardware, Objectives, Candidate, plan,
+    divisibility_violations, attn_param_mem_bytes, InadmissibleDegree,
+    _kv_cache_page_bytes_per_layer,
 )
 from engine.physical.builders import build_node_scale  # noqa: E402
 
@@ -180,3 +184,123 @@ def test_plan_still_filters_memory_infeasibility_without_asking_the_evaluator():
     assert result.winner is None
     assert asked_tp == []
     assert all("memory" in r.reason for r in result.rejections)
+
+
+# ------------------------------------------------- Part A: divisibility (task 39)
+
+
+def test_divisibility_violations_empty_for_a_dividing_degree():
+    model = _model((1, 2, 4, 8))  # num_attention_heads=8, hidden_size=256
+    assert divisibility_violations(model, 4) == []
+
+
+def test_divisibility_violations_catches_non_dividing_attn_tp():
+    model = ModelSpec("odd-heads-model", total_experts=1, router_topk=1, is_moe=False,
+                      hidden_size=256, num_attention_heads=64, num_key_value_heads=64, num_layers=2)
+    violations = divisibility_violations(model, 3)
+    assert violations
+    assert any("num_attention_heads" in v for v in violations)
+
+
+def test_divisibility_violations_catches_model_level_mismatch_independent_of_tp():
+    # hidden_size not divisible by num_attention_heads at all -- Frontier's
+    # own third assertion, which does not even mention attn_tp.
+    model = ModelSpec("bad-model", total_experts=1, router_topk=1, is_moe=False,
+                      hidden_size=100, num_attention_heads=7, num_key_value_heads=7, num_layers=2)
+    violations = divisibility_violations(model, 1)
+    assert any("independent of attn_tp" in v for v in violations)
+
+
+def test_attn_param_mem_bytes_raises_inadmissible_degree_for_non_dividing_tp():
+    model = ModelSpec("odd-heads-model", total_experts=1, router_topk=1, is_moe=False,
+                      hidden_size=256, num_attention_heads=64, num_key_value_heads=64, num_layers=2)
+    with pytest.raises(InadmissibleDegree):
+        attn_param_mem_bytes(model, 3)
+
+
+def test_plan_reports_inadmissible_separately_from_rejected_and_unknown():
+    """A non-dividing degree must show up in `result.inadmissible`, never
+    in `result.rejections` (it is not a memory failure) or
+    `result.unknown` (it is not a gap in the evaluator's own coverage) --
+    and the evaluator must never be asked about it at all, since
+    inadmissibility is decided before `feasible_num_blocks` is even
+    called (task 39's own known trap)."""
+    asked_tp = []
+
+    class RecordingEvaluator(FakeEvaluator):
+        def can_evaluate(self, candidate):
+            asked_tp.append(candidate.attn_tp)
+            return super().can_evaluate(candidate)
+
+    model = ModelSpec("64-heads-model", total_experts=1, router_topk=1, is_moe=False,
+                      admissible_tp=(1, 3), hidden_size=256, num_attention_heads=64,
+                      num_key_value_heads=64, num_layers=2)
+    objectives = Objectives(slo_tpot_ms=15.0, min_throughput_rps=0.0, minimize="mean_tpot_ms")
+    evaluator = RecordingEvaluator({
+        1: {"mean_tpot_ms": 20.0, "throughput_rps": 50.0, "slo_attainment": 0.5},
+        3: {"mean_tpot_ms": 5.0, "throughput_rps": 500.0, "slo_attainment": 1.0},
+    })
+
+    result = plan(_topology(), model, _workload(), _hardware(), objectives, evaluator)
+
+    assert 3 not in asked_tp  # tp=3 never reached the evaluator at all
+    assert any(i.candidate_key.startswith("tp3_") for i in result.inadmissible)
+    assert not any(r.candidate_key.startswith("tp3_") for r in result.rejections)
+    assert not any(u.candidate_key.startswith("tp3_") for u in result.unknown)
+    assert result.winner["candidate"].attn_tp == 1  # the only admissible degree
+
+
+# --------------------------------------- Part B: runtime vs. raw KV heads (task 39)
+
+
+def test_kv_cache_page_bytes_defaults_match_the_raw_fields_for_dense_models():
+    """Pins the agreement for the DENSE_KV family -- every model this
+    formula has been validated against (tasks 36/38). Leaving
+    `runtime_num_kv_heads`/`runtime_head_dim` at `None` must give exactly
+    the same page size as setting them explicitly to the raw fields --
+    proving the default *is* the DENSE_KV resolver, not merely something
+    that happens not to have been contradicted yet."""
+    dense_model = ModelSpec("dense", total_experts=1, router_topk=1, is_moe=False,
+                            hidden_size=4096, num_attention_heads=16, num_key_value_heads=4,
+                            num_layers=32, head_dim=128)
+    explicit_override = ModelSpec("dense", total_experts=1, router_topk=1, is_moe=False,
+                                  hidden_size=4096, num_attention_heads=16, num_key_value_heads=4,
+                                  num_layers=32, head_dim=128,
+                                  runtime_num_kv_heads=4, runtime_head_dim=128)
+    for tp in (1, 2, 4, 8):
+        assert (_kv_cache_page_bytes_per_layer(dense_model, tp, 16)
+               == _kv_cache_page_bytes_per_layer(explicit_override, tp, 16))
+
+
+def test_kv_cache_page_bytes_uses_the_override_when_the_raw_fields_would_be_wrong():
+    """deepseek-v3's own real numbers (confirmed directly against a real
+    Frontier `SimulationConfig` in this task's own investigation, not
+    assumed): raw `num_key_value_heads=128`, `get_head_dim()=56`, but
+    `get_runtime_num_kv_heads()=1` and `get_runtime_head_size()=576` --
+    the LATENT_MLA family's own hard-coded resolution
+    (`kv_lora_rank=512 + qk_rope_head_dim=64`), unconditionally, not
+    derived from the declared head count at all. Without the override,
+    this formula would use the raw pair and get a KV-cache page size
+    ~12.4x too large at tp=1 -- this test proves the override, once
+    supplied, corrects it, without requiring a full deepseek-v3
+    simulation (which needs mi355x profiling data this checkout does
+    not exercise through any real-compute tool)."""
+    raw_only = ModelSpec("deepseek-v3-like", total_experts=256, router_topk=8, is_moe=True,
+                        hidden_size=7168, num_attention_heads=128, num_key_value_heads=128,
+                        num_layers=61, head_dim=56)
+    with_runtime_override = ModelSpec("deepseek-v3-like", total_experts=256, router_topk=8, is_moe=True,
+                                     hidden_size=7168, num_attention_heads=128, num_key_value_heads=128,
+                                     num_layers=61, head_dim=56,
+                                     runtime_num_kv_heads=1, runtime_head_dim=576)
+
+    raw_page_bytes = _kv_cache_page_bytes_per_layer(raw_only, attn_tp=1, block_size=16)
+    corrected_page_bytes = _kv_cache_page_bytes_per_layer(with_runtime_override, attn_tp=1, block_size=16)
+
+    # raw: kv_per_worker=ceil(128/1)=128, head_dim=56 -> 128*56=7168
+    # runtime: kv_per_worker=ceil(1/1)=1, head_dim=576 -> 1*576=576
+    # ratio: 7168/576 ~= 12.44x
+    assert raw_page_bytes == 2 * 16 * 2 * 128 * 56
+    assert corrected_page_bytes == 2 * 16 * 2 * 1 * 576
+    assert raw_page_bytes > corrected_page_bytes
+    ratio = raw_page_bytes / corrected_page_bytes
+    assert 12.0 < ratio < 12.5

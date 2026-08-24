@@ -28,7 +28,7 @@ would misrepresent what it is for.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 from engine.physical.topology import Fabric
@@ -82,6 +82,34 @@ class ModelSpec:
     # chooses) -- this is what `SimulationEvaluator.can_evaluate` reads,
     # a fact about the profile data, not a search-scope decision.
     profiled_tp: Tuple[int, ...] = (1, 2, 4, 8)
+    # Task 39 Part B: Frontier reads a KV head count and a head size
+    # *twice*, for two different purposes, and they are not always the
+    # same field. `ParamCounter` (parameter memory, `attn_param_mem_bytes`
+    # below) always reads the raw `num_key_value_heads`/`get_head_dim()`
+    # pair. `MemoryPlanner`'s own KV-cache sizing reads the
+    # *attention-family-resolved* pair instead
+    # (`ModelConfig.get_runtime_num_kv_heads()`/`get_runtime_head_size()`,
+    # `frontier/attention/families.py`'s own per-family resolvers). For
+    # the DENSE_KV family -- every model this project has real h800/
+    # rtx_pro_6000 profiles for, confirmed by checking each one's own
+    # attention-family binding, not assumed -- the two are identical by
+    # construction, so leaving these at `None` (falling back to the raw
+    # fields) is correct, not a guess. For a LATENT_MLA model (this
+    # checkout's own deepseek-v3/deepseek-r1-0528, mi355x-profiled only,
+    # confirmed via `bind_attention_family`: `use_mla` is inferred from
+    # `model_type in {deepseek_v2, deepseek_v3, deepseek_mtp, kimi_k2}`
+    # plus a declared `kv_lora_rank`) the resolved KV head count is
+    # *always* 1 regardless of the declared field, and the resolved head
+    # size is `kv_lora_rank + qk_rope_head_dim`, not `get_head_dim()` --
+    # a caller with such a model must supply both explicitly. This
+    # formula does not implement per-family resolution itself (Part B's
+    # own "do not approximate an assertion" trap): a model whose
+    # attention family is not DENSE_KV and does not set these two fields
+    # will silently get the DENSE_KV answer, which is exactly the failure
+    # this project keeps finding. Nothing here auto-detects the family;
+    # the caller must know.
+    runtime_num_kv_heads: Optional[int] = None
+    runtime_head_dim: Optional[int] = None
 
 
 @dataclass
@@ -190,8 +218,78 @@ _KV_CACHE_BLOCK_SIZE = 16  # this project's own standing convention (tasks 22-33
 _KV_FACTOR = 2  # DENSE_KV family (standard MHA/GQA, K+V) -- frontier/attention/families.py
 
 
+class InadmissibleDegree(ValueError):
+    """Raised when `attn_tp` does not evenly divide this model's own
+    structure -- `frontier/utils/param_counter.py`'s own
+    `ParamCounter.__init__` asserts exactly these conditions before
+    computing anything, and would raise `AssertionError` rather than
+    return a fractional-heads-per-worker answer. A property of the
+    (model, degree) *request*, not of available memory (task 39's own
+    known trap: reporting this as a memory failure would attribute a
+    property of the request to the hardware) -- kept as a distinct
+    exception from the plain `ValueError` a malformed `ModelSpec` raises,
+    so `plan()` can catch this one specifically without also swallowing
+    that one."""
+
+
+def divisibility_violations(model: ModelSpec, attn_tp: int) -> List[str]:
+    """The three conditions `ParamCounter.__init__` asserts, checked
+    without raising -- `plan()`'s own loop uses this to decide a
+    candidate is inadmissible *before* ever calling
+    `feasible_num_blocks`, so an inadmissible degree never gets
+    generated into shapes or reported as a memory rejection. Empty list
+    means every condition holds.
+
+    Frontier's own third assertion (`embedding_dim % num_q_heads == 0`)
+    is a property of the model alone, independent of `attn_tp` -- it is
+    still checked here because `attn_param_mem_bytes` computes
+    `hidden_size // num_attention_heads` as `head_dim`'s own fallback,
+    and that division being inexact would silently truncate rather than
+    raise, exactly the failure this project keeps finding."""
+    violations = []
+    if model.num_attention_heads <= 0:
+        return violations  # feasible_num_blocks's own ValueError covers this
+    if model.num_attention_heads % attn_tp != 0:
+        violations.append(
+            f"num_attention_heads ({model.num_attention_heads}) is not divisible "
+            f"by attn_tp ({attn_tp})")
+    if model.hidden_size % attn_tp != 0:
+        violations.append(
+            f"hidden_size ({model.hidden_size}) is not divisible by attn_tp ({attn_tp})")
+    if model.hidden_size % model.num_attention_heads != 0:
+        violations.append(
+            f"hidden_size ({model.hidden_size}) is not divisible by num_attention_heads "
+            f"({model.num_attention_heads}) -- a model-level property, independent of attn_tp")
+    return violations
+
+
 def _attn_head_dim(model: ModelSpec) -> int:
     return model.head_dim if model.head_dim is not None else model.hidden_size // model.num_attention_heads
+
+
+def _runtime_kv_heads(model: ModelSpec) -> int:
+    """The KV head count `MemoryPlanner`'s own KV-cache sizing reads
+    (`Replica.kv_heads_per_tensor_parallel_worker` ->
+    `ModelConfig.get_runtime_num_kv_heads()`), as opposed to the raw
+    field `ParamCounter` reads for parameter memory. Identical to the
+    raw field for the DENSE_KV family (every model this project has
+    real h800/rtx_pro_6000 profiles for) -- `runtime_num_kv_heads=None`
+    means exactly that, not "unknown." A LATENT_MLA model (this
+    checkout's own deepseek-v3/deepseek-r1-0528) resolves this to `1`
+    regardless of the declared field; such a caller must set
+    `runtime_num_kv_heads` explicitly (task 39's own Part B)."""
+    return model.runtime_num_kv_heads if model.runtime_num_kv_heads is not None else model.num_key_value_heads
+
+
+def _runtime_head_dim(model: ModelSpec) -> int:
+    """The head size `MemoryPlanner`'s own KV-cache sizing reads
+    (`get_runtime_head_size()`), as opposed to `get_head_dim()` (which
+    `attn_param_mem_bytes` uses for parameter memory, matching
+    `ParamCounter` exactly). Identical for DENSE_KV; a LATENT_MLA model
+    resolves this to `kv_lora_rank + qk_rope_head_dim`, not
+    `get_head_dim()` -- such a caller must set `runtime_head_dim`
+    explicitly."""
+    return model.runtime_head_dim if model.runtime_head_dim is not None else _attn_head_dim(model)
 
 
 def attn_param_mem_bytes(model: ModelSpec, attn_tp: int) -> int:
@@ -201,11 +299,19 @@ def attn_param_mem_bytes(model: ModelSpec, attn_tp: int) -> int:
     cluster's memory, task 35's own S0 scoping point) and
     `frontier/scheduler/utils/memory_planner.py`'s own unconditional
     2-bytes/param assumption. Verified bit-for-bit against
-    `ParamCounter.get_num_parameters_per_device()` for both
-    Phi-tiny-MoE-instruct (671088640/335544320/167772160/100663296 params
-    at tp=1/2/4/8) and Llama-3.1-405B-Instruct-FP8
-    (71873593344/35936796672/17968398336/8984199168/4756340736/2642411520
-    at tp=1/2/4/8/16/32) before use, not assumed from a formula alone."""
+    `ParamCounter.get_num_parameters_per_device()` for
+    Phi-tiny-MoE-instruct, Llama-3.1-405B-Instruct-FP8, and
+    step-moe-noquant-small (tasks 36/38) before use, not assumed from a
+    formula alone.
+
+    Raises `InadmissibleDegree` if `attn_tp` does not evenly divide this
+    model -- Frontier's own `ParamCounter.__init__` would assert on
+    exactly this rather than compute a fractional-heads-per-worker
+    answer (task 39 Part A)."""
+    violations = divisibility_violations(model, attn_tp)
+    if violations:
+        raise InadmissibleDegree(
+            f"attn_tp={attn_tp} is inadmissible for {model.model_name!r}: " + "; ".join(violations))
     head_dim = _attn_head_dim(model)
     q_per_worker = model.num_attention_heads / attn_tp
     kv_per_worker = -(-model.num_key_value_heads // attn_tp)  # ceil
@@ -217,9 +323,13 @@ def attn_param_mem_bytes(model: ModelSpec, attn_tp: int) -> int:
 def _kv_cache_page_bytes_per_layer(model: ModelSpec, attn_tp: int, block_size: int) -> int:
     """`frontier/scheduler/utils/memory_planner.py`'s own
     `_get_kv_cache_memory_per_layer_per_block`: 2 bytes/element x
-    block_size x kv_factor x kv_heads_per_worker x head_dim."""
-    head_dim = _attn_head_dim(model)
-    kv_per_worker = -(-model.num_key_value_heads // attn_tp)
+    block_size x kv_factor x kv_heads_per_worker x head_dim -- using the
+    *runtime-resolved* kv-head-count and head-dim (task 39 Part B), not
+    the raw/param-counting ones `attn_param_mem_bytes` uses. Identical
+    values for every model this formula has been validated against
+    (DENSE_KV); see `_runtime_kv_heads`/`_runtime_head_dim`."""
+    head_dim = _runtime_head_dim(model)
+    kv_per_worker = -(-_runtime_kv_heads(model) // attn_tp)
     return 2 * block_size * _KV_FACTOR * kv_per_worker * head_dim
 
 
@@ -235,7 +345,12 @@ def feasible_num_blocks(model: ModelSpec, hardware: Hardware, attn_tp: int) -> O
     a running system would compute the identical number from the same
     three inputs. This is why feasibility is filtered here, in the
     search, rather than delegated to whatever `Evaluator` `plan()` was
-    given (task 37's own S3)."""
+    given (task 37's own S3).
+
+    Raises `InadmissibleDegree` (via `attn_param_mem_bytes`) if `attn_tp`
+    does not evenly divide this model -- `plan()`'s own loop checks
+    `divisibility_violations` before ever calling this, so that path is
+    for any other caller (task 39 Part A)."""
     if model.num_attention_heads <= 0 or model.hidden_size <= 0 or model.num_layers <= 0:
         raise ValueError(
             f"ModelSpec({model.model_name!r}) is missing hidden_size/"
@@ -343,11 +458,29 @@ class Unknown:
 
 
 @dataclass
+class Inadmissible:
+    """A candidate degree that does not evenly divide this model's own
+    structure -- `attn_tp` doesn't divide `num_attention_heads`, or
+    `hidden_size` doesn't divide by `attn_tp` or by `num_attention_heads`
+    (task 39 Part A). Distinct from both `Rejection` (a property of
+    hardware/memory at a given margin) and `Unknown` (a gap in one
+    evaluator's own coverage): this is a property of the (model, degree)
+    *request* alone, true regardless of hardware, margin, or which
+    evaluator `plan()` was given. This project's own known trap: a
+    degree that cannot divide the model is not infeasible on memory and
+    not a constraint failure -- reporting it as either would attribute
+    a property of the request to the hardware or the evaluator instead."""
+    candidate_key: str
+    reason: str
+
+
+@dataclass
 class PlanResult:
     winner: Optional[dict]
     ranked: List[dict]
     rejections: List[Rejection]
     unknown: List[Unknown]
+    inadmissible: List[Inadmissible] = field(default_factory=list)
 
 
 def plan(topology: Topology, model: ModelSpec, workload: Workload, hardware: Hardware,
@@ -372,9 +505,14 @@ def plan(topology: Topology, model: ModelSpec, workload: Workload, hardware: Har
 
     rejections: List[Rejection] = []
     unknown: List[Unknown] = []
+    inadmissible: List[Inadmissible] = []
     evaluated: List[dict] = []
 
     for attn_tp in attn_tp_values:
+        violations = divisibility_violations(model, attn_tp)
+        if violations:
+            inadmissible.append(Inadmissible(f"tp{attn_tp}_*", "; ".join(violations)))
+            continue
         num_blocks = feasible_num_blocks(model, hardware, attn_tp)
         if num_blocks is None:
             rejections.append(Rejection(f"tp{attn_tp}_*", "memory: infeasible at this margin"))
@@ -411,4 +549,5 @@ def plan(topology: Topology, model: ModelSpec, workload: Workload, hardware: Har
 
     evaluated.sort(key=lambda r: r[objectives.minimize])
     winner = evaluated[0] if evaluated else None
-    return PlanResult(winner=winner, ranked=evaluated, rejections=rejections, unknown=unknown)
+    return PlanResult(winner=winner, ranked=evaluated, rejections=rejections, unknown=unknown,
+                     inadmissible=inadmissible)
