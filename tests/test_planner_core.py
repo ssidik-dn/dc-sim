@@ -29,7 +29,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 from planner_core import (  # noqa: E402
-    Topology, ModelSpec, Workload, Hardware, Objectives, Candidate, plan,
+    Topology, ModelSpec, Workload, Hardware, Objectives, Candidate, Regime, plan,
+    plan_two_stage,
     divisibility_violations, attn_param_mem_bytes, InadmissibleDegree,
     _kv_cache_page_bytes_per_layer,
     lane_assignment_feasible, default_attn_dp_size_policy,
@@ -39,6 +40,13 @@ from planner_core import (  # noqa: E402
 from engine.physical.builders import build_node_scale  # noqa: E402
 
 _PLANNER_CORE_PATH = Path(__file__).resolve().parent.parent / "tools" / "planner_core.py"
+
+# Task 45: every test in this file predates the arrival-regime axis and
+# means "burst" (the only regime that ever existed before this task) --
+# named once here rather than spelled out at each of `plan()`'s own 15
+# call sites below, since the point of every one of those tests is
+# ranking/rejection/inadmissibility logic, not the regime axis itself.
+BURST = Regime(seeded=False, num_seeds=1)
 
 
 # --------------------------------------------------- the seam is real, not nominal
@@ -117,7 +125,7 @@ def test_plan_ranks_correctly_against_a_fake_evaluator_with_no_frontier_present(
         2: {"mean_tpot_ms": 10.0, "throughput_rps": 100.0, "slo_attainment": 0.9},
     })
 
-    result = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives, evaluator)
+    result = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives, BURST, evaluator)
 
     assert result.winner is not None
     assert result.winner["candidate"].attn_tp == 2
@@ -139,7 +147,7 @@ def test_plan_reports_a_throughput_floor_rejection_distinctly():
         2: {"mean_tpot_ms": 10.0, "throughput_rps": 100.0, "slo_attainment": 0.9},
     })
 
-    result = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives, evaluator)
+    result = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives, BURST, evaluator)
 
     assert result.winner["candidate"].attn_tp == 2
     tp1_rejections = [r for r in result.rejections if r.candidate_key.startswith("tp1_")]
@@ -157,7 +165,7 @@ def test_plan_reports_unknown_separately_from_rejected():
         1: {"mean_tpot_ms": 20.0, "throughput_rps": 50.0, "slo_attainment": 0.5},
     })
 
-    result = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives, evaluator)
+    result = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives, BURST, evaluator)
 
     assert result.winner["candidate"].attn_tp == 1
     assert any(u.candidate_key.startswith("tp2_") for u in result.unknown)
@@ -182,7 +190,7 @@ def test_plan_still_filters_memory_infeasibility_without_asking_the_evaluator():
     # evaluator is ever consulted.
     starved_hardware = Hardware(device="h800", memory_margin_fraction=0.999999)
 
-    result = plan(_topology(), _model((1, 2)), _workload(), starved_hardware, objectives, evaluator)
+    result = plan(_topology(), _model((1, 2)), _workload(), starved_hardware, objectives, BURST, evaluator)
 
     assert result.winner is None
     assert asked_tp == []
@@ -244,7 +252,7 @@ def test_plan_reports_inadmissible_separately_from_rejected_and_unknown():
         3: {"mean_tpot_ms": 5.0, "throughput_rps": 500.0, "slo_attainment": 1.0},
     })
 
-    result = plan(_topology(), model, _workload(), _hardware(), objectives, evaluator)
+    result = plan(_topology(), model, _workload(), _hardware(), objectives, BURST, evaluator)
 
     assert 3 not in asked_tp  # tp=3 never reached the evaluator at all
     assert any(i.candidate_key.startswith("tp3_") for i in result.inadmissible)
@@ -365,7 +373,7 @@ def test_plan_reports_lane_violation_as_inadmissible_not_rejected():
     })
     objectives = Objectives(slo_tpot_ms=15.0, min_throughput_rps=0.0, minimize="mean_tpot_ms")
 
-    result = plan(_topology(), _model((2,)), _workload(), _hardware(), objectives, evaluator,
+    result = plan(_topology(), _model((2,)), _workload(), _hardware(), objectives, BURST, evaluator,
                  replica_ratios=((1, 1), (1, 2)), attn_dp_size_policy=lambda ar, fr: 1)
 
     violating = [i for i in result.inadmissible if "_fr2" in i.candidate_key]
@@ -390,9 +398,9 @@ def test_plan_restricted_to_1to1_matches_the_unextended_search():
     })
 
     default_result = plan(_topology(), _model((1, 2)), _workload(), _hardware(),
-                          objectives, evaluator)
+                          objectives, BURST, evaluator)
     explicit_result = plan(_topology(), _model((1, 2)), _workload(), _hardware(),
-                           objectives, evaluator, replica_ratios=((1, 1),))
+                           objectives, BURST, evaluator, replica_ratios=((1, 1),))
 
     assert [r["candidate"].key for r in default_result.ranked] == \
         [r["candidate"].key for r in explicit_result.ranked]
@@ -412,9 +420,9 @@ def test_plan_adding_more_ratios_does_not_perturb_the_1to1_candidates():
         2: {"mean_tpot_ms": 10.0, "throughput_rps": 100.0, "slo_attainment": 0.9},
     })
 
-    narrow = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives, evaluator,
+    narrow = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives, BURST, evaluator,
                  replica_ratios=((1, 1),))
-    wide = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives, evaluator,
+    wide = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives, BURST, evaluator,
                replica_ratios=((1, 1), (2, 1), (1, 2), (3, 2)))
 
     narrow_1to1 = {r["candidate"].key: r["mean_tpot_ms"] for r in narrow.ranked}
@@ -579,7 +587,7 @@ def test_plan_default_ep_values_gives_only_the_trivial_ep_shape():
     evaluator = EpAwareFakeEvaluator({
         2: {"mean_tpot_ms": 10.0, "throughput_rps": 100.0, "slo_attainment": 0.9},
     })
-    result = plan(_topology(), _model((2,)), _workload(), _hardware(), objectives, evaluator)
+    result = plan(_topology(), _model((2,)), _workload(), _hardware(), objectives, BURST, evaluator)
     assert result.ranked
     for r in result.ranked:
         assert r["candidate"].ep_shape == (1,)
@@ -598,9 +606,9 @@ def test_plan_restricted_to_single_expert_group_matches_the_unextended_search():
     })
 
     default_result = plan(_topology(), _model((1, 2)), _workload(), _hardware(),
-                          objectives, evaluator)
+                          objectives, BURST, evaluator)
     explicit_result = plan(_topology(), _model((1, 2)), _workload(), _hardware(),
-                           objectives, evaluator, ep_values=(1,))
+                           objectives, BURST, evaluator, ep_values=(1,))
 
     assert [r["candidate"].key for r in default_result.ranked] == \
         [r["candidate"].key for r in explicit_result.ranked]
@@ -619,12 +627,215 @@ def test_plan_adding_ep_values_does_not_perturb_the_single_group_candidates():
         2: {"mean_tpot_ms": 10.0, "throughput_rps": 100.0, "slo_attainment": 0.9},
     })
 
-    narrow = plan(_topology(), _model((2,)), _workload(), _hardware(), objectives, evaluator,
+    narrow = plan(_topology(), _model((2,)), _workload(), _hardware(), objectives, BURST, evaluator,
                  ep_values=(1,))
-    wide = plan(_topology(), _model((2,)), _workload(), _hardware(), objectives, evaluator,
+    wide = plan(_topology(), _model((2,)), _workload(), _hardware(), objectives, BURST, evaluator,
                ep_values=(1, 2))
 
     narrow_ep1 = {r["candidate"].key: r["mean_tpot_ms"] for r in narrow.ranked}
     wide_ep1 = {r["candidate"].key: r["mean_tpot_ms"] for r in wide.ranked
                if r["candidate"].ffn_ep == 1}
     assert narrow_ep1 == wide_ep1
+
+
+# --------------------------------------------------------- plan() with regime
+
+
+def test_regime_rejects_multiple_seeds_of_a_deterministic_burst():
+    """Task 45's own known trap, enforced at construction: repeating a
+    `t=0` burst `num_seeds` times produces `num_seeds` identical numbers
+    -- a zero-width interval that looks like confidence but measures
+    nothing."""
+    with pytest.raises(ValueError):
+        Regime(seeded=False, num_seeds=6)
+
+
+def test_regime_rejects_zero_seeds():
+    with pytest.raises(ValueError):
+        Regime(seeded=True, num_seeds=0)
+
+
+class RegimeAwareFakeEvaluator:
+    """Unlike `FakeEvaluator`, this evaluator's own canned prices depend
+    on which `Regime` it was constructed with -- mirroring task 44's own
+    real finding (expert degree slowest under burst, fastest under
+    streaming) with `attn_tp` standing in for expert degree, so this
+    test proves `plan()`'s own `regime` parameter actually reaches
+    ranking, without invoking Frontier."""
+
+    def __init__(self, regime: Regime):
+        self._regime = regime
+
+    def can_evaluate(self, candidate: Candidate) -> bool:
+        return candidate.attn_tp in (1, 2)
+
+    def evaluate(self, candidate: Candidate) -> dict:
+        if self._regime.seeded:
+            price = {1: 5.0, 2: 8.0}[candidate.attn_tp]   # tp=1 wins streaming
+        else:
+            price = {1: 12.0, 2: 6.0}[candidate.attn_tp]  # tp=2 wins burst
+        return {"mean_tpot_ms": price, "throughput_rps": 100.0, "slo_attainment": 1.0, "error": None}
+
+
+def test_regime_input_changes_the_ranking():
+    """Task 45's own required acceptance test: a case where the regime
+    passed to `plan()` changes which candidate wins -- the same shape of
+    reversal task 44 found for real (one degree last under burst, first
+    under streaming)."""
+    objectives = Objectives(slo_tpot_ms=15.0, min_throughput_rps=0.0, minimize="mean_tpot_ms")
+    burst = Regime(seeded=False, num_seeds=1)
+    streaming = Regime(seeded=True, num_seeds=6)
+
+    burst_result = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives,
+                        burst, RegimeAwareFakeEvaluator(burst))
+    streaming_result = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives,
+                            streaming, RegimeAwareFakeEvaluator(streaming))
+
+    assert burst_result.winner["candidate"].attn_tp == 2
+    assert streaming_result.winner["candidate"].attn_tp == 1
+
+
+class CIAwareFakeEvaluator:
+    """A fake evaluator that reports `ci95_halfwidth` directly, so
+    indistinguishability logic can be tested without a real seeded
+    Frontier run."""
+
+    def __init__(self, price_by_tp: dict):
+        self._price_by_tp = price_by_tp
+
+    def can_evaluate(self, candidate: Candidate) -> bool:
+        return candidate.attn_tp in self._price_by_tp
+
+    def evaluate(self, candidate: Candidate) -> dict:
+        p = self._price_by_tp[candidate.attn_tp]
+        return {"mean_tpot_ms": p["mean"], "ci95_halfwidth": p["ci"],
+                "throughput_rps": 100.0, "slo_attainment": 1.0, "error": None}
+
+
+def test_plan_marks_overlapping_intervals_as_indistinguishable_from_winner():
+    """Task 45's own central known trap: 'indistinguishable is not
+    tied.' tp=2's own interval [9.5, 11.5] overlaps the winner's (tp=1,
+    [9.0, 11.0]) -- reported as indistinguishable, not as a worse
+    candidate. tp=4's own interval [19, 21] does not overlap either --
+    reported as genuinely, measurably behind."""
+    objectives = Objectives(slo_tpot_ms=15.0, min_throughput_rps=0.0, minimize="mean_tpot_ms")
+    regime = Regime(seeded=True, num_seeds=6)
+    evaluator = CIAwareFakeEvaluator({
+        1: {"mean": 10.0, "ci": 1.0},
+        2: {"mean": 10.5, "ci": 1.0},
+        4: {"mean": 20.0, "ci": 1.0},
+    })
+    result = plan(_topology(), _model((1, 2, 4)), _workload(), _hardware(), objectives,
+                 regime, evaluator)
+    by_tp = {r["candidate"].attn_tp: r for r in result.ranked}
+    assert result.winner["candidate"].attn_tp == 1
+    assert by_tp[1]["indistinguishable_from_winner"] is False
+    assert by_tp[2]["indistinguishable_from_winner"] is True
+    assert by_tp[4]["indistinguishable_from_winner"] is False
+
+
+def test_plan_burst_never_marks_anyone_indistinguishable():
+    """A deterministic burst result carries no `ci95_halfwidth` at all
+    (task 45's own acceptance requirement: burst behaves exactly as it
+    always did) -- so every row's own `indistinguishable_from_winner`
+    is `False`, the same strict order this project has always reported."""
+    objectives = Objectives(slo_tpot_ms=15.0, min_throughput_rps=0.0, minimize="mean_tpot_ms")
+    evaluator = FakeEvaluator({
+        1: {"mean_tpot_ms": 10.0, "throughput_rps": 100.0, "slo_attainment": 0.9},
+        2: {"mean_tpot_ms": 10.05, "throughput_rps": 100.0, "slo_attainment": 0.9},
+    })
+    result = plan(_topology(), _model((1, 2)), _workload(), _hardware(), objectives, BURST, evaluator)
+    assert all(r["indistinguishable_from_winner"] is False for r in result.ranked)
+
+
+# ------------------------------------------------------- plan_two_stage()
+
+
+class ShapeAwareFakeEvaluator:
+    """Stage-1-style fake, for `shortlist_regime`: prices favour the
+    single-domain packed shape (`len(attn_shape) == 1`) over any split
+    shape -- Part A's own validated axis -- and rank `ffn_ep` the way
+    task 33's own burst measurement did (ep=4 cheapest, ep=1 dearest)."""
+
+    def can_evaluate(self, candidate: Candidate) -> bool:
+        return True
+
+    def evaluate(self, candidate: Candidate) -> dict:
+        shape_penalty = 0.0 if len(candidate.attn_shape) == 1 else 5.0
+        ep_price = {1: 12.0, 2: 9.0, 4: 6.0}[candidate.ffn_ep]
+        return {"mean_tpot_ms": ep_price + shape_penalty, "throughput_rps": 100.0,
+               "slo_attainment": 1.0, "error": None}
+
+
+class SizingReversingFakeEvaluator:
+    """Stage-2-style fake, for `streaming_regime`: the *same* shape
+    preference (placement holds across regimes, Part A's own finding)
+    but `ffn_ep`'s own ranking reversed relative to the burst fake above
+    -- ep=1 cheapest, ep=4 dearest -- task 44's own real reversal."""
+
+    def can_evaluate(self, candidate: Candidate) -> bool:
+        return True
+
+    def evaluate(self, candidate: Candidate) -> dict:
+        shape_penalty = 0.0 if len(candidate.attn_shape) == 1 else 5.0
+        ep_price = {1: 3.0, 2: 4.0, 4: 5.0}[candidate.ffn_ep]
+        return {"mean_tpot_ms": ep_price + shape_penalty, "ci95_halfwidth": 0.1,
+               "throughput_rps": 100.0, "slo_attainment": 1.0, "error": None}
+
+
+def test_plan_two_stage_shortlists_placement_but_not_sizing():
+    """Task 45 Part B's own central design property: the placement axis
+    (`attn_shape`) is shortlisted cheaply under `shortlist_regime`, but
+    every `ffn_ep` value `plan()` would have generated still reaches
+    stage 2 -- none of them shortlisted away, even though stage 1's own
+    (burst-flavoured) fake ranks them in the opposite order stage 2's
+    own (streaming-flavoured) fake does. The winner reflects stage 2's
+    measurement, not stage 1's filtered guess."""
+    objectives = Objectives(slo_tpot_ms=1000.0, min_throughput_rps=0.0, minimize="mean_tpot_ms")
+    shortlist_regime = Regime(seeded=False, num_seeds=1)
+    streaming_regime = Regime(seeded=True, num_seeds=6)
+
+    result = plan_two_stage(_topology(), _model((2,)), _workload(), _hardware(), objectives,
+                            shortlist_regime, ShapeAwareFakeEvaluator(),
+                            streaming_regime, SizingReversingFakeEvaluator(),
+                            shortlist_size=1, ep_values=(1, 2, 4))
+
+    eps_in_stage2 = {r["candidate"].ffn_ep for r in result.ranked}
+    assert eps_in_stage2 == {1, 2, 4}, "every sizing value must reach stage 2, none pre-filtered"
+
+    for row in result.shortlisted:
+        assert len(row["candidate"].attn_shape) == 1, "stage 1 must keep only the packed placement"
+
+    assert result.winner["candidate"].ffn_ep == 1, "the winner must reflect stage 2's own ranking"
+    assert result.stage1.ranked, "stage 1's own result is exposed, not discarded"
+    assert result.shortlist_size == 1
+    assert result.shortlist_regime is shortlist_regime
+    assert result.streaming_regime is streaming_regime
+
+
+def test_plan_two_stage_relaxes_objectives_floors_at_stage_1_only():
+    """Task 45's own known trap, applied to constraints rather than
+    ranking: a throughput/SLO floor is exactly as regime-dependent as
+    the ranking itself (task 42's own S1), so stage 1 must not reject a
+    candidate on those floors -- only stage 2, against real streaming
+    numbers, may. Here every candidate's burst-fake throughput is 0.0
+    (would fail a `min_throughput_rps=50` floor if stage 1 enforced it)
+    but its streaming-fake throughput is 100.0 (passes) -- the winner
+    must still appear, proving stage 1 let it through un-rejected."""
+    objectives = Objectives(slo_tpot_ms=1000.0, min_throughput_rps=50.0, minimize="mean_tpot_ms")
+    shortlist_regime = Regime(seeded=False, num_seeds=1)
+    streaming_regime = Regime(seeded=True, num_seeds=6)
+
+    class ZeroThroughputBurstEvaluator(ShapeAwareFakeEvaluator):
+        def evaluate(self, candidate: Candidate) -> dict:
+            r = super().evaluate(candidate)
+            r["throughput_rps"] = 0.0
+            return r
+
+    result = plan_two_stage(_topology(), _model((2,)), _workload(), _hardware(), objectives,
+                            shortlist_regime, ZeroThroughputBurstEvaluator(),
+                            streaming_regime, SizingReversingFakeEvaluator(),
+                            shortlist_size=1, ep_values=(1,))
+
+    assert result.winner is not None
+    assert result.stage2_rejections == []

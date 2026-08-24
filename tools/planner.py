@@ -30,14 +30,15 @@ from typing import List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from planner_core import (  # noqa: E402
-    Topology, ModelSpec, Workload, Hardware, Objectives, Candidate,
-    Rejection, Unknown, PlanResult, Evaluator,
+    Topology, ModelSpec, Workload, Hardware, Objectives, Candidate, Regime,
+    Rejection, Unknown, PlanResult, TwoStagePlanResult, Evaluator,
     feasible_num_blocks, lane_assignment_feasible, enumerate_attn_shapes,
     enumerate_joint_arrangements,
     attn_param_mem_bytes,
     plan as _core_plan,
+    plan_two_stage as _core_plan_two_stage,
 )
-from seed_stats import seed_argv_fix  # noqa: E402
+from seed_stats import seed_argv_fix, compute_interval_stats  # noqa: E402
 from engine.logical.deployment import Deployment, PoolKind, Replica  # noqa: E402
 from engine.placement.placement import explicit, PlacementError  # noqa: E402
 from engine.placement.binding import BindingPolicy  # noqa: E402
@@ -354,30 +355,101 @@ class SimulationEvaluator:
     evaluator prices it exactly like any other candidate.
     """
 
-    def __init__(self, topology: Topology, model: ModelSpec, workload: Workload, hardware: Hardware):
+    def __init__(self, topology: Topology, model: ModelSpec, workload: Workload, hardware: Hardware,
+                regime: Optional[Regime] = None):
         self.topology = topology
         self.model = model
         self.workload = workload
         self.hardware = hardware
+        # Task 45: bound here, not threaded through `evaluate(candidate)` --
+        # exactly how topology/model/workload/hardware are already bound,
+        # since a regime is a property of *how* this evaluator is asked to
+        # price anything, not of one candidate. `Regime(seeded=False,
+        # num_seeds=1)` (every call site from tasks 33-44, none of which
+        # pass this) reproduces the single deterministic run those tasks
+        # always got -- task 45's own acceptance requirement.
+        self.regime = regime if regime is not None else Regime(seeded=False, num_seeds=1)
 
     def can_evaluate(self, candidate: Candidate) -> bool:
         return candidate.attn_tp in self.model.profiled_tp and candidate.attn_replicas == 1
 
     def evaluate(self, candidate: Candidate) -> dict:
         num_blocks = feasible_num_blocks(self.model, self.hardware, candidate.attn_tp)
-        return evaluate(self.topology, self.model, self.workload, self.hardware,
-                        candidate, num_blocks, seed=0, seeded=False)
+        if self.regime.num_seeds <= 1:
+            r = evaluate(self.topology, self.model, self.workload, self.hardware,
+                        candidate, num_blocks, seed=0, seeded=self.regime.seeded)
+            if not r.get("error"):
+                r["ci95_halfwidth"] = None
+                r["n_seeds"] = 1
+            return r
+
+        # Task 45: `regime.num_seeds > 1` -- average `mean_tpot_ms` (and,
+        # for the same reason, `throughput_rps`/`slo_attainment`) over
+        # `num_seeds` independent Poisson-staggered draws
+        # (`seed_stats.seed_argv_fix`, task 31's own mechanism), and
+        # report the 95% CI half-width on that average as this
+        # candidate's own resolution -- a single seeded draw is one point
+        # on a distribution, not a measurement of it (task 45's own known
+        # trap).
+        tpot_vals: List[float] = []
+        throughput_vals: List[float] = []
+        slo_vals: List[float] = []
+        for seed in range(self.regime.num_seeds):
+            r = evaluate(self.topology, self.model, self.workload, self.hardware,
+                        candidate, num_blocks, seed=seed, seeded=True)
+            if r.get("error"):
+                return r
+            tpot_vals.append(r["mean_tpot_ms"])
+            throughput_vals.append(r["throughput_rps"])
+            slo_vals.append(r["slo_attainment"])
+        stats = compute_interval_stats(tpot_vals)
+        return {
+            "key": candidate.key, "error": None,
+            "mean_tpot_ms": stats.mean,
+            "throughput_rps": statistics.mean(throughput_vals),
+            "slo_attainment": statistics.mean(slo_vals),
+            "ci95_halfwidth": stats.ci95_halfwidth,
+            "n_seeds": self.regime.num_seeds,
+        }
 
 
 def plan(topology: Topology, model: ModelSpec, workload: Workload, hardware: Hardware,
-        objectives: Objectives, evaluator: Optional[Evaluator] = None, **kwargs) -> PlanResult:
+        objectives: Objectives, regime: Regime,
+        evaluator: Optional[Evaluator] = None, **kwargs) -> PlanResult:
     """`planner_core.plan()`, defaulting `evaluator` to a fresh
     `SimulationEvaluator` bound to this call's own
-    topology/model/workload/hardware -- the reason every call site from
-    tasks 33/36 (none of which pass an evaluator) reproduces unchanged."""
+    topology/model/workload/hardware/regime.
+
+    `regime` has no default, here or in `planner_core.plan()` -- task
+    45's own explicit point: every candidate's own price depends on the
+    arrival process it was priced under, and a default would silently
+    pick one (almost certainly burst, since that is what every
+    evaluator's own plumbing predates) instead of making a caller
+    choose. Every call site from tasks 33-44 predates this parameter and
+    always meant burst without ever having said so; reproducing any of
+    them now means passing `Regime(seeded=False, num_seeds=1)`
+    explicitly -- the point of this task, not an inconvenience of it."""
     if evaluator is None:
-        evaluator = SimulationEvaluator(topology, model, workload, hardware)
-    return _core_plan(topology, model, workload, hardware, objectives, evaluator, **kwargs)
+        evaluator = SimulationEvaluator(topology, model, workload, hardware, regime)
+    return _core_plan(topology, model, workload, hardware, objectives, regime, evaluator, **kwargs)
+
+
+def plan_two_stage(topology: Topology, model: ModelSpec, workload: Workload, hardware: Hardware,
+                   objectives: Objectives, shortlist_regime: Regime, streaming_regime: Regime,
+                   shortlist_evaluator: Optional[Evaluator] = None,
+                   streaming_evaluator: Optional[Evaluator] = None, **kwargs) -> TwoStagePlanResult:
+    """`planner_core.plan_two_stage()`, defaulting both evaluators to a
+    fresh `SimulationEvaluator` each, bound to this call's own
+    topology/model/workload/hardware and to `shortlist_regime`/
+    `streaming_regime` respectively -- the same default-construction
+    convenience `plan()` already provides."""
+    if shortlist_evaluator is None:
+        shortlist_evaluator = SimulationEvaluator(topology, model, workload, hardware, shortlist_regime)
+    if streaming_evaluator is None:
+        streaming_evaluator = SimulationEvaluator(topology, model, workload, hardware, streaming_regime)
+    return _core_plan_two_stage(topology, model, workload, hardware, objectives,
+                                shortlist_regime, shortlist_evaluator,
+                                streaming_regime, streaming_evaluator, **kwargs)
 
 
 # ------------------------------------------------------------ topologies

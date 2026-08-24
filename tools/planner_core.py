@@ -28,7 +28,7 @@ would misrepresent what it is for.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Callable, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 from engine.physical.topology import Fabric
@@ -131,6 +131,57 @@ class Hardware:
     per-cluster override, task 24's own finding)."""
     device: str
     memory_margin_fraction: float
+
+
+@dataclass
+class Regime:
+    """How requests arrive, and how many independent draws `plan()` asks
+    its evaluator to average per candidate before ranking -- task 45's
+    own explicit input, alongside `topology`/`model`/`workload`/
+    `hardware`/`objectives`, deliberately with no default `plan()`
+    itself supplies: every prior task (32-44) evaluated every candidate
+    at `Regime(seeded=False, num_seeds=1)` -- every request submitted
+    simultaneously at `t=0` -- without ever having chosen that on
+    purpose, because nothing before task 31 offered another option
+    (task 31's own finding, task 42's own confirmation: every real-
+    compute tool through task 28 was "completely deterministic given
+    everything except `--seed`," since arrivals were always pinned to
+    `t=0`). Task 42/44 both found this regime's own ranking can reverse
+    under genuine staggered arrival -- this field exists so a caller
+    states which regime a ranking is *for*, rather than inheriting one
+    by accident.
+
+    `seeded=True` asks the evaluator to use `seed_stats.seed_argv_fix`
+    (Poisson-staggered arrivals at the workload's own qps, task 31's
+    own mechanism) instead of the `t=0` burst. `num_seeds` is how many
+    independent seeds each candidate is averaged over under that
+    regime -- 1 is a single draw, not a measurement (task 45's own
+    known trap, echoing task 31 S1.3's "a single seeded run is one
+    point on a distribution, not the distribution"); the resulting
+    `ci95_halfwidth` this project's `seed_stats.compute_interval_stats`
+    reports on that average is this search's own resolution -- two
+    candidates whose intervals overlap are indistinguishable at this
+    `num_seeds`, not tied and not orderable, and `plan()` marks them as
+    such rather than imposing a strict order the measurement does not
+    support.
+
+    `num_seeds > 1` with `seeded=False` is rejected outright, not
+    silently run: repeating a deterministic `t=0` burst `num_seeds`
+    times produces `num_seeds` identical numbers, a zero-width interval
+    that looks like confidence but measures nothing -- the same error
+    this project's own reports keep finding in a single unseeded run
+    presented as if it were a distribution."""
+    seeded: bool = False
+    num_seeds: int = 1
+
+    def __post_init__(self) -> None:
+        if self.num_seeds > 1 and not self.seeded:
+            raise ValueError(
+                "Regime(num_seeds > 1, seeded=False) repeats a deterministic burst "
+                "run num_seeds times -- every draw is identical, so the resulting "
+                "interval has zero width and measures nothing. Set seeded=True.")
+        if self.num_seeds < 1:
+            raise ValueError(f"Regime.num_seeds must be >= 1, got {self.num_seeds}")
 
 
 @dataclass
@@ -686,10 +737,51 @@ class PlanResult:
     rejections: List[Rejection]
     unknown: List[Unknown]
     inadmissible: List[Inadmissible] = field(default_factory=list)
+    regime: Optional["Regime"] = None
+
+
+def _mark_indistinguishable_from_winner(evaluated: List[dict], minimize: str) -> None:
+    """Task 45: a candidate's own `ci95_halfwidth` (present whenever its
+    result came from `Regime(num_seeds > 1)`; absent, i.e. `None`, from
+    a single deterministic burst run) makes some strict orderings
+    unsupported by the measurement itself. Sets
+    `row["indistinguishable_from_winner"]` on every row in `evaluated`
+    (already sorted by `minimize`) -- `True` when that row's own
+    `[mean - ci, mean + ci]` interval overlaps the winner's, `False`
+    otherwise, including for every row when no row carries a
+    `ci95_halfwidth` at all (a burst search's own strict order is
+    exactly as supported as it always was -- this function is a no-op
+    in effect for `Regime(num_seeds=1)`, per task 45's own acceptance
+    requirement that burst results keep reproducing unchanged).
+
+    This does not reorder anything: `evaluated` is still sorted by
+    `minimize`, and "indistinguishable" is a property reported
+    alongside that order, not a replacement for it (task 45's own known
+    trap -- "indistinguishable is not tied" cuts both ways: it is also
+    not a silent demotion)."""
+    if not evaluated:
+        return
+    winner = evaluated[0]
+    w_ci = winner.get("ci95_halfwidth")
+    w_mean = winner[minimize]
+    for row in evaluated:
+        row["indistinguishable_from_winner"] = False
+    if w_ci is None:
+        return
+    w_lo, w_hi = w_mean - w_ci, w_mean + w_ci
+    for row in evaluated[1:]:
+        ci = row.get("ci95_halfwidth")
+        if ci is None:
+            continue
+        mean = row[minimize]
+        lo, hi = mean - ci, mean + ci
+        if not (hi < w_lo or lo > w_hi):
+            row["indistinguishable_from_winner"] = True
 
 
 def plan(topology: Topology, model: ModelSpec, workload: Workload, hardware: Hardware,
-        objectives: Objectives, evaluator: Evaluator, *, attn_tp_values: Tuple[int, ...] = None,
+        objectives: Objectives, regime: Regime, evaluator: Evaluator, *,
+        attn_tp_values: Tuple[int, ...] = None,
         ep_values: Tuple[int, ...] = None,
         replica_ratios: Tuple[Tuple[int, int], ...] = ((1, 1),),
         attn_dp_size_policy: Callable[[int, int], int] = default_attn_dp_size_policy) -> PlanResult:
@@ -705,6 +797,20 @@ def plan(topology: Topology, model: ModelSpec, workload: Workload, hardware: Har
     nothing about Frontier, so it cannot name a default. `tools/planner.py`'s
     own `plan()` wraps this one with `SimulationEvaluator()` as the
     default, which is what keeps every existing call site unchanged.
+
+    `regime` is required too, with no default -- task 45's own point:
+    every candidate's price depends on the arrival process it was
+    priced under, and a default here would silently pick one (burst,
+    almost certainly, since that is what every evaluator's own
+    plumbing predates) instead of making a caller choose. This function
+    does not itself run anything under `regime` -- that is
+    `evaluator`'s own job, and a `Regime`-blind `Evaluator` (a fake, or
+    a future telemetry-backed one with no seed concept at all) is free
+    to ignore it -- but every evaluated result's own optional
+    `ci95_halfwidth` key (present whenever the evaluator actually
+    averaged over `regime.num_seeds > 1` seeds) is used here, after
+    sorting, to mark which candidates are indistinguishable from the
+    winner rather than merely ranked below it.
 
     `replica_ratios` defaults to `((1, 1),)` -- every call site from
     tasks 32/33/36 (which never pass it) reproduces bit-identically,
@@ -777,6 +883,151 @@ def plan(topology: Topology, model: ModelSpec, workload: Workload, hardware: Har
                     evaluated.append(r)
 
     evaluated.sort(key=lambda r: r[objectives.minimize])
+    _mark_indistinguishable_from_winner(evaluated, objectives.minimize)
     winner = evaluated[0] if evaluated else None
     return PlanResult(winner=winner, ranked=evaluated, rejections=rejections, unknown=unknown,
-                     inadmissible=inadmissible)
+                     inadmissible=inadmissible, regime=regime)
+
+
+# ------------------------------------------------------------ two-stage search
+
+
+def _sizing_key(candidate: Candidate) -> Tuple[int, int, int, int]:
+    """The axis task 41/44 already showed reverses under streaming --
+    `attn_tp`'s own *degree* is deliberately excluded from this key (it
+    is the placement/compute-parallelism axis Part A validated, task
+    42's own conclusions 4/5: "tp=2 beats tp=1" held under streaming),
+    while `ffn_ep` and the replica counts are included (task 44's own
+    ep-degree reversal; task 41's own "more FFN replicas is 34% faster
+    [burst] / 2.8% slower [streaming]"). `attn_tp` is grouped alongside
+    these because a *placement* shortlist is only comparable within one
+    fixed `attn_tp` -- shapes at different `attn_tp` are not
+    substitutable choices for the same slot."""
+    return (candidate.attn_tp, candidate.ffn_ep, candidate.attn_replicas, candidate.ffn_replicas)
+
+
+@dataclass
+class TwoStagePlanResult:
+    """Task 45 Part B. `ranked`/`winner` are always stage 2's own
+    measured result -- never stage 1's filtered one -- because a
+    filtered ordering and a measured one are not the same kind of
+    object (task 45's own known trap) and reporting the cheap one as if
+    it were the expensive one is exactly the error this design exists
+    to avoid. `shortlisted` is stage 1's own output, kept so a caller
+    can see what was filtered out, from what, and under which (cheap)
+    regime -- not thrown away once stage 2 runs."""
+    winner: Optional[dict]
+    ranked: List[dict]
+    shortlisted: List[dict]
+    shortlist_regime: Regime
+    streaming_regime: Regime
+    shortlist_size: int
+    stage1: PlanResult
+    stage2_rejections: List[Rejection]
+    stage2_unknown: List[Unknown]
+
+
+def plan_two_stage(topology: Topology, model: ModelSpec, workload: Workload, hardware: Hardware,
+                   objectives: Objectives, shortlist_regime: Regime, shortlist_evaluator: Evaluator,
+                   streaming_regime: Regime, streaming_evaluator: Evaluator, *,
+                   shortlist_size: int = 1,
+                   attn_tp_values: Tuple[int, ...] = None,
+                   ep_values: Tuple[int, ...] = None,
+                   replica_ratios: Tuple[Tuple[int, int], ...] = ((1, 1),),
+                   attn_dp_size_policy: Callable[[int, int], int] = default_attn_dp_size_policy
+                   ) -> TwoStagePlanResult:
+    """Task 45 Part B's own two-stage design -- scoped exactly to what
+    Part A measured, not to "the search" in general (task 45's own
+    known trap: a rank correlation on one search is one data point).
+
+    Part A found, on task 33's own 16-candidate table (varying
+    `attn_tp` and its own placement `attn_shape` only -- the
+    compute-parallelism/placement axis, nothing about capacity), a
+    Spearman rank correlation of 1.0 between burst and streaming
+    orderings: the streaming winner sat at burst rank 1 of 16. That
+    result -- and task 42's own independent finding that this same axis
+    "held" under streaming (conclusions 1, 4, 5) -- is why *this*
+    function shortlists placements cheaply. It does not, and must not,
+    shortlist `ffn_ep` or `(attn_replicas, ffn_replicas)` the same way:
+    those are the *sizing* axis task 41 and task 44 already measured
+    reversing under streaming (task 41's own replica ratio: burst-better
+    becomes streaming-worse; task 44's own EP degree: burst-last becomes
+    streaming-first) -- pre-filtering that axis by a burst ranking is
+    exactly the failure Part A exists to catch, and this design refuses
+    to do it: `stage 2` evaluates every sizing combination `plan()`
+    would have generated, none shortlisted, only the placement within
+    each narrowed to `shortlist_size`.
+
+    **Stage 1** (`shortlist_regime`, conventionally burst -- cheap,
+    deterministic, one run per candidate) runs the *unmodified* `plan()`
+    search across the full space, but with `objectives`'s own
+    `min_throughput_rps`/`slo_attainment_floor` zeroed out first: those
+    two constraints are regime-dependent facts about queueing behaviour
+    (task 42's own S1: a burst manufactures contention a real stream
+    does not), and rejecting a candidate on them at the cheap stage
+    would risk discarding the eventual streaming winner on the
+    constraint axis exactly as Part A worried about on the ranking axis.
+    Only regime-independent infeasibility (memory, divisibility, lane
+    assignment -- `Inadmissible`/the memory `Rejection`) is filtered at
+    stage 1; the real objectives are applied only once, at stage 2,
+    against real streaming numbers.
+
+    Stage 1's own survivors are grouped by `_sizing_key` (`attn_tp`,
+    `ffn_ep`, `attn_replicas`, `ffn_replicas`) and each group's own
+    `shortlist_size` best-by-`objectives.minimize` placements
+    (`attn_shape`, `ep_shape`) are kept -- everything else is discarded
+    here, cheaply, before any seeded evaluation runs.
+
+    **Stage 2** (`streaming_regime`, conventionally seeded with
+    `num_seeds > 1` -- expensive, per task 45's own resolution point)
+    re-evaluates every shortlisted `Candidate` under `streaming_evaluator`,
+    applies the real `objectives` (including its own floors) for the
+    first time, ranks the survivors, and marks indistinguishability from
+    the winner exactly as `plan()` itself does."""
+    relaxed_objectives = _dc_replace(objectives, min_throughput_rps=0.0, slo_attainment_floor=0.0)
+    stage1 = plan(topology, model, workload, hardware, relaxed_objectives, shortlist_regime,
+                 shortlist_evaluator, attn_tp_values=attn_tp_values, ep_values=ep_values,
+                 replica_ratios=replica_ratios, attn_dp_size_policy=attn_dp_size_policy)
+
+    by_sizing: Dict[Tuple[int, int, int, int], List[dict]] = {}
+    for row in stage1.ranked:
+        by_sizing.setdefault(_sizing_key(row["candidate"]), []).append(row)
+
+    shortlisted: List[dict] = []
+    for _, rows in by_sizing.items():
+        rows.sort(key=lambda r: r[relaxed_objectives.minimize])
+        shortlisted.extend(rows[:shortlist_size])
+
+    rejections: List[Rejection] = []
+    unknown: List[Unknown] = []
+    evaluated: List[dict] = []
+    for row in shortlisted:
+        candidate = row["candidate"]
+        if not streaming_evaluator.can_evaluate(candidate):
+            unknown.append(Unknown(candidate.key,
+                "evaluator cannot price this candidate (outside its own coverage)"))
+            continue
+        r = streaming_evaluator.evaluate(candidate)
+        if r.get("error"):
+            rejections.append(Rejection(candidate.key, f"evaluation error: {r['error']}"))
+            continue
+        r["candidate"] = candidate
+        if r["throughput_rps"] < objectives.min_throughput_rps:
+            rejections.append(Rejection(candidate.key,
+                f"throughput floor: {r['throughput_rps']:.3f} < {objectives.min_throughput_rps}"))
+            continue
+        if r["slo_attainment"] < objectives.slo_attainment_floor - 1e-9:
+            rejections.append(Rejection(candidate.key,
+                f"SLO: attainment {r['slo_attainment']:.3f} below required "
+                f"{objectives.slo_attainment_floor}"))
+            continue
+        evaluated.append(r)
+
+    evaluated.sort(key=lambda r: r[objectives.minimize])
+    _mark_indistinguishable_from_winner(evaluated, objectives.minimize)
+    winner = evaluated[0] if evaluated else None
+    return TwoStagePlanResult(
+        winner=winner, ranked=evaluated, shortlisted=shortlisted,
+        shortlist_regime=shortlist_regime, streaming_regime=streaming_regime,
+        shortlist_size=shortlist_size, stage1=stage1,
+        stage2_rejections=rejections, stage2_unknown=unknown)
