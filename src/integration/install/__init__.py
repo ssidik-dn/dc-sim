@@ -50,11 +50,15 @@ from ..m2n_transfer import predictor as _m2n_transfer_predictor  # noqa: F401  (
 from ..replica_scheduler.sglang_guard import (
     install_sglang_replica_scheduler_guard as _install_sglang_replica_scheduler_guard,
 )
+from ..execution_time_predictor.mla_phase_filter import (
+    install_mla_phase_filter as _install_mla_phase_filter,
+)
 
 
 def install(fabric: Fabric, placement: Placement, deployment: Deployment,
            groups: CommGroupRegistry, binding: Optional[BindingConfig] = None,
-           collective: bool = False, sglang_replica_scheduler: bool = False) -> None:
+           collective: bool = False, sglang_replica_scheduler: bool = False,
+           mla_phase_filter: bool = False) -> None:
     """Register every engine-backed Frontier extension, and make the engine
     state they need reachable. Safe to call more than once.
 
@@ -80,11 +84,21 @@ def install(fabric: Fabric, placement: Placement, deployment: Deployment,
     -- nothing else about the class changes. `False` (the default) leaves
     `SGLangStyleReplicaScheduler.__init__` untouched, same as every task
     before this one.
+
+    `mla_phase_filter` (task 53) is optional and defaults to `False`. `True`
+    patches `SklearnExecutionTimePredictor._train_mla_attention_layer_models`
+    (`..execution_time_predictor.mla_phase_filter`, guarded by a source hash)
+    so each MLA attention operator trains only on the phase(s) its own family
+    spec declares, instead of on every profiled row regardless of phase.
+    `False` (the default) leaves `_train_mla_attention_layer_models`
+    untouched, same as every task before this one.
     """
     _cc_backend.install()
     if collective:
         _install_collective_backend()
     if sglang_replica_scheduler:
         _install_sglang_replica_scheduler_guard()
+    if mla_phase_filter:
+        _install_mla_phase_filter()
     _set_context(EngineContext(fabric, placement, deployment, groups, binding=binding,
                                collective=collective))
