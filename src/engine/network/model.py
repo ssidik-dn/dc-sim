@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .allocator import (Allocation, FlowKey, LinkKey, MIN_RATE,
                         max_min_fair_share, verify_conservation)
+from .contention_counters import COUNTERS as _CONTENTION_COUNTERS
 
 
 class FlowState(Enum):
@@ -83,6 +84,9 @@ class FlowNetwork:
         self._alloc: Allocation = Allocation()
         self._completed: List[Completion] = []
         self.reallocations: int = 0
+        # Task 50: observation only -- see contention_counters.py's own
+        # docstring for why this cannot feed back into anything computed.
+        _CONTENTION_COUNTERS.networks_constructed += 1
 
     # -- state --------------------------------------------------------------
     @property
@@ -149,9 +153,29 @@ class FlowNetwork:
     def _reallocate(self) -> None:
         live = self._active()
         flow_links = {k: self._flows[k].links for k in live}
+        # Task 50: observation only, from state already computed for the
+        # real allocation below -- see contention_counters.py's own
+        # docstring for why this cannot feed back into anything computed.
+        if len(live) > _CONTENTION_COUNTERS.max_flows_in_flight:
+            _CONTENTION_COUNTERS.max_flows_in_flight = len(live)
+        old_alloc = self._alloc
         self._alloc = max_min_fair_share(flow_links, self.capacity)
         if self.verify:
             verify_conservation(self._alloc, flow_links, self.capacity)
+        for k in live:
+            new_rate = self._alloc.rate(k)
+            # A flow's own unconstrained ("solo") rate: what it would get if
+            # every link it uses were entirely its own. Empty link list
+            # already means infinite rate in max_min_fair_share itself.
+            solo_rate = min((self.capacity[lk] for lk in flow_links[k]), default=float("inf"))
+            if new_rate < solo_rate - 1e-6:
+                _CONTENTION_COUNTERS.rate_reductions += 1
+            # A revision is a rate change for a flow that was *already*
+            # tracked before this reallocation -- the newly-submitted flow
+            # (if any) is getting its first allocation, not a revision of
+            # one it already had.
+            if k in old_alloc.rates and new_rate != old_alloc.rate(k):
+                _CONTENTION_COUNTERS.completion_revisions += 1
         self.revision += 1
         self.reallocations += 1
 
