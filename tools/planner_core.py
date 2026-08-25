@@ -110,6 +110,18 @@ class ModelSpec:
     # the caller must know.
     runtime_num_kv_heads: Optional[int] = None
     runtime_head_dim: Optional[int] = None
+    # Task 48: `frontier/attention/families.py`'s own per-family
+    # `kv_factor` -- 2 for DENSE_KV (separate K and V caches), **1 for
+    # LATENT_MLA** (`get_attention_runtime_kv_layout`, `frontier/attention/memory.py`:
+    # `elements_per_token_per_worker = kv_factor * runtime_num_kv_heads_per_worker
+    # * runtime_head_size`) -- MLA stores one compressed latent, not a
+    # separate K and V. `None` means "use this module's own `_KV_FACTOR`
+    # constant (2)", correct for every DENSE_KV model this formula has
+    # been validated against; a LATENT_MLA caller must pass `kv_factor=1`
+    # explicitly, mirroring `runtime_num_kv_heads`/`runtime_head_dim`'s
+    # own established idiom -- no auto-detection, same reasoning task 39
+    # already gave for those two fields.
+    kv_factor: Optional[int] = None
 
 
 @dataclass
@@ -380,17 +392,31 @@ def attn_param_mem_bytes(model: ModelSpec, attn_tp: int) -> int:
     return int(2 * per_layer * model.num_layers)
 
 
+def _runtime_kv_factor(model: ModelSpec) -> int:
+    """`frontier/attention/families.py`'s own per-family `kv_factor` --
+    2 for DENSE_KV (this module's own `_KV_FACTOR`), **1 for LATENT_MLA**
+    (task 48's own finding: MLA stores one compressed latent, not a
+    separate K and V cache -- confirmed against Frontier's own
+    `MemoryPlanner` directly for deepseek-v3, which disagreed with this
+    formula by exactly 2x before this field existed). `kv_factor=None`
+    means "use `_KV_FACTOR`," correct for every DENSE_KV model this
+    formula has been validated against; a LATENT_MLA caller must set
+    `kv_factor=1` explicitly."""
+    return model.kv_factor if model.kv_factor is not None else _KV_FACTOR
+
+
 def _kv_cache_page_bytes_per_layer(model: ModelSpec, attn_tp: int, block_size: int) -> int:
     """`frontier/scheduler/utils/memory_planner.py`'s own
     `_get_kv_cache_memory_per_layer_per_block`: 2 bytes/element x
     block_size x kv_factor x kv_heads_per_worker x head_dim -- using the
-    *runtime-resolved* kv-head-count and head-dim (task 39 Part B), not
-    the raw/param-counting ones `attn_param_mem_bytes` uses. Identical
-    values for every model this formula has been validated against
-    (DENSE_KV); see `_runtime_kv_heads`/`_runtime_head_dim`."""
+    *runtime-resolved* kv-head-count, head-dim, and kv_factor (task 39
+    Part B; kv_factor added task 48), not the raw/param-counting ones
+    `attn_param_mem_bytes` uses. Identical values for every model this
+    formula has been validated against (DENSE_KV); see
+    `_runtime_kv_heads`/`_runtime_head_dim`/`_runtime_kv_factor`."""
     head_dim = _runtime_head_dim(model)
     kv_per_worker = -(-_runtime_kv_heads(model) // attn_tp)
-    return 2 * block_size * _KV_FACTOR * kv_per_worker * head_dim
+    return 2 * block_size * _runtime_kv_factor(model) * kv_per_worker * head_dim
 
 
 def feasible_num_blocks(model: ModelSpec, hardware: Hardware, attn_tp: int) -> Optional[int]:
