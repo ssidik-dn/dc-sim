@@ -47,11 +47,14 @@ from ..context import set_context as _set_context
 from . import cc_backend as _cc_backend
 from ..kv_transfer import predictor as _kv_transfer_predictor  # noqa: F401  (see docstring)
 from ..m2n_transfer import predictor as _m2n_transfer_predictor  # noqa: F401  (see docstring)
+from ..replica_scheduler.sglang_guard import (
+    install_sglang_replica_scheduler_guard as _install_sglang_replica_scheduler_guard,
+)
 
 
 def install(fabric: Fabric, placement: Placement, deployment: Deployment,
            groups: CommGroupRegistry, binding: Optional[BindingConfig] = None,
-           collective: bool = False) -> None:
+           collective: bool = False, sglang_replica_scheduler: bool = False) -> None:
     """Register every engine-backed Frontier extension, and make the engine
     state they need reachable. Safe to call more than once.
 
@@ -68,9 +71,20 @@ def install(fabric: Fabric, placement: Placement, deployment: Deployment,
     the run's own argv used. `False` (the default) leaves
     `CCBackendFactory.create` untouched, same as every task before this
     one.
+
+    `sglang_replica_scheduler` (task 47) is optional and defaults to
+    `False`. `True` relaxes `SGLangStyleReplicaScheduler.__init__`'s own
+    cluster-type refusal (`..replica_scheduler.sglang_guard`, guarded by a
+    source hash) so `--...replica_scheduler_config_type sglang` can be
+    selected for `DECODE_ATTN`/`DECODE_FFN`, not only `MONOLITHIC`/`PREFILL`
+    -- nothing else about the class changes. `False` (the default) leaves
+    `SGLangStyleReplicaScheduler.__init__` untouched, same as every task
+    before this one.
     """
     _cc_backend.install()
     if collective:
         _install_collective_backend()
+    if sglang_replica_scheduler:
+        _install_sglang_replica_scheduler_guard()
     _set_context(EngineContext(fabric, placement, deployment, groups, binding=binding,
                                collective=collective))

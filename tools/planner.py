@@ -54,7 +54,8 @@ _SCRIPT_PATH = str(Path(__file__).resolve())
 
 
 def _argv(topology: Topology, model: ModelSpec, workload: Workload, hardware: Hardware,
-         candidate: Candidate, num_blocks: int, run_id: str, seed: int, extra: List[str]) -> List[str]:
+         candidate: Candidate, num_blocks: int, run_id: str, seed: int, extra: List[str],
+         decode_ffn_scheduler: str = "orca") -> List[str]:
     return [
         "frontier.main",
         "--simulation_mode", "offline",
@@ -97,7 +98,7 @@ def _argv(topology: Topology, model: ModelSpec, workload: Workload, hardware: Ha
 
         "--cluster_config_prefill_replica_scheduler_config_type", "vllm_v1",
         "--cluster_config_decode_attn_replica_scheduler_config_type", "vllm_v1",
-        "--cluster_config_decode_ffn_replica_scheduler_config_type", "orca",
+        "--cluster_config_decode_ffn_replica_scheduler_config_type", decode_ffn_scheduler,
 
         "--cc_backend_config_type", "analytical",
         "--m2n_transfer_config_type", "empirical",
@@ -196,7 +197,7 @@ def _run_scenario(topology_name: str, model_name: str, candidate_key: str,
                   total_experts: int, router_topk: int, is_moe: bool,
                   hidden_size: int, num_attention_heads: int,
                   num_key_value_heads: int, num_layers: int, head_dim: Optional[int],
-                  seed: int, seeded: bool) -> None:
+                  seed: int, seeded: bool, decode_ffn_scheduler: str = "orca") -> None:
     topology = _TOPOLOGIES[topology_name]()
     model = ModelSpec(model_name, total_experts, router_topk, is_moe=is_moe,
                       hidden_size=hidden_size, num_attention_heads=num_attention_heads,
@@ -225,11 +226,20 @@ def _run_scenario(topology_name: str, model_name: str, candidate_key: str,
     placement = _placement_for(topology, d, candidate)
     binding = (BindingConfig(BindingPolicy.ROUND_ROBIN, timing="early")
               if max(attn_replicas, ffn_replicas) > 1 else None)
-    install(topology.fabric, placement, d, reg, binding=binding, collective=True)
+    # Task 47: the relaxed-guard patch is always installed, the same way
+    # `collective=True` always is -- harmless unless a caller actually
+    # selects `sglang` for a cluster type it wasn't previously reachable
+    # for (nothing here does, unless `decode_ffn_scheduler="sglang"` is
+    # passed explicitly). This is exactly the acceptance requirement Task
+    # 47's own §4 asks for: installing the patch must not, by itself,
+    # change anything that keeps the original policy selected.
+    install(topology.fabric, placement, d, reg, binding=binding, collective=True,
+           sglang_replica_scheduler=True)
 
     extra = seed_argv_fix(seed) if seeded else []
     tag = f"plan_{topology_name}_{candidate_key}_seed{seed}_seeded{int(seeded)}"
-    sys.argv = _argv(topology, model, workload, hardware, candidate, num_blocks, tag, seed, extra)
+    sys.argv = _argv(topology, model, workload, hardware, candidate, num_blocks, tag, seed, extra,
+                     decode_ffn_scheduler=decode_ffn_scheduler)
 
     from frontier.config import SimulationConfig
     from frontier.simulator import Simulator
@@ -269,7 +279,8 @@ def _run_scenario(topology_name: str, model_name: str, candidate_key: str,
 
 
 def evaluate(topology: Topology, model: ModelSpec, workload: Workload, hardware: Hardware,
-            candidate: Candidate, num_blocks: int, seed: int = 0, seeded: bool = False) -> dict:
+            candidate: Candidate, num_blocks: int, seed: int = 0, seeded: bool = False,
+            decode_ffn_scheduler: str = "orca") -> dict:
     """Runs one candidate through Frontier in a subprocess and returns
     its result dict. Kept as a free function, not folded into
     `SimulationEvaluator` alone, because seeded re-runs (tasks 31-36's
@@ -298,7 +309,8 @@ def evaluate(topology: Topology, model: ModelSpec, workload: Workload, hardware:
          "--num-key-value-heads", str(model.num_key_value_heads),
          "--num-layers", str(model.num_layers),
          "--head-dim", str(model.head_dim) if model.head_dim is not None else "none",
-         "--seed", str(seed), "--seeded", "1" if seeded else "0"],
+         "--seed", str(seed), "--seeded", "1" if seeded else "0",
+         "--decode-ffn-scheduler", decode_ffn_scheduler],
         capture_output=True, text=True, cwd=str(FRONTIER_ROOT))
     for line in proc.stdout.splitlines():
         if line.startswith(_RESULT_MARKER):
@@ -574,6 +586,7 @@ if __name__ == "__main__":
     parser.add_argument("--head-dim", type=str, default="none")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seeded", type=int, default=0)
+    parser.add_argument("--decode-ffn-scheduler", type=str, default="orca")
     args = parser.parse_args()
     if args.topology is not None:
         head_dim = None if args.head_dim == "none" else int(args.head_dim)
@@ -585,6 +598,6 @@ if __name__ == "__main__":
                      args.total_experts, args.router_topk, bool(args.is_moe),
                      args.hidden_size, args.num_attention_heads,
                      args.num_key_value_heads, args.num_layers, head_dim,
-                     args.seed, bool(args.seeded))
+                     args.seed, bool(args.seeded), args.decode_ffn_scheduler)
         raise SystemExit(0)
     raise SystemExit(0)
