@@ -227,12 +227,24 @@ class Candidate:
     ep_shape: Tuple[int, ...] = (1,)
     attn_replicas: int = 1
     ffn_replicas: int = 1
+    # Task 57: which of the two groups' own occupied-domain sets this
+    # candidate uses -- "same" (includes today's colocated arrangement),
+    # "disjoint" (attention whole on one machine, experts whole on
+    # another -- task 55/56's own unreachable arrangement), or
+    # "overlapping"; `None` at `ffn_ep=1`/`attn_tp=1`, where only one
+    # real group exists and the question does not apply. Needed because
+    # `(attn_shape, ep_shape)` alone is no longer unique once
+    # `enumerate_joint_arrangements` can return two placements that
+    # share it -- disambiguates exactly the way `attn_shape`/`ep_shape`
+    # themselves disambiguate a single group's own split.
+    relative: Optional[str] = None
 
     @property
     def key(self) -> str:
+        rel_suffix = f"_rel{self.relative}" if self.relative is not None else ""
         return (f"tp{self.attn_tp}_shape{'-'.join(map(str, self.attn_shape))}"
                f"_ep{self.ffn_ep}_epshape{'-'.join(map(str, self.ep_shape))}"
-               f"_ar{self.attn_replicas}_fr{self.ffn_replicas}")
+               f"{rel_suffix}_ar{self.attn_replicas}_fr{self.ffn_replicas}")
 
 
 # ----------------------------------------------------------------- evaluator
@@ -611,7 +623,7 @@ def enumerate_replica_arrangements(topology: Topology, attn_tp: int, attn_replic
 
 def enumerate_joint_arrangements(topology: Topology, attn_tp: int, ffn_ep: int,
                                  n_fragmented_seeds: int = 60
-                                 ) -> Dict[Tuple[Tuple[int, ...], Tuple[int, ...]], object]:
+                                 ) -> Dict[Tuple[Tuple[int, ...], Tuple[int, ...], Optional[str]], object]:
     """Task 44's own extension: `enumerate_attn_shapes` (task 32) searches
     DECODE_ATTN's own TP group in isolation; this searches DECODE_ATTN's
     TP group and DECODE_FFN's own expert-parallel group *together*, on
@@ -628,20 +640,41 @@ def enumerate_joint_arrangements(topology: Topology, attn_tp: int, ffn_ep: int,
     the other dispatches tokens to experts -- so giving shape A to
     attention and shape B to the expert group is a *different*
     arrangement from giving A to the expert group and B to attention.
-    The canonical key is an ordered pair, `(attn_shape, ep_shape)`,
-    never sorted together: task 41's own interchangeable-replica
-    reasoning applies to *enumerating* several groups of the *same*
-    kind (task 41's own attention replicas), not to two groups of
-    different kinds, which is exactly this task's own known trap.
+    The canonical key's first two components are an ordered pair,
+    `(attn_shape, ep_shape)`, never sorted together: task 41's own
+    interchangeable-replica reasoning applies to *enumerating* several
+    groups of the *same* kind (task 41's own attention replicas), not to
+    two groups of different kinds, which is exactly this task's own
+    known trap.
+
+    **The key has a third component, `relative` (task 57).** Task 56
+    found that "attention whole on one machine, experts whole on
+    another" was unreachable even though `fragmented()` genuinely
+    constructs it: `group_shape()`'s own per-group signature records
+    only how many ranks land in each domain, never *which* domain, so
+    that arrangement's key collided with the colocated arrangement's
+    (both `((attn_tp,), (ffn_ep,))`) and whichever was discovered first
+    -- always the colocated one, since `packed`/`spread` run before the
+    `fragmented` seeds -- silently kept the other one out.
+    `_relative_domain_placement` (below) adds exactly the missing
+    information, without changing `group_shape()` itself (other callers
+    -- `enumerate_attn_shapes`, task 41's replica enumeration -- depend
+    on its current, single-group behaviour and must not see this):
+    whether the two groups' own occupied-domain sets are identical
+    (`"same"`), disjoint (`"disjoint"`), or neither (`"overlapping"`).
+    `None` when either group does not exist (`attn_tp=1` or
+    `ffn_ep=1`) -- see the docstring below for why that keeps every
+    single-group case's own *set* of keys unchanged in substance.
 
     At `ffn_ep=1` there is no expert-parallel group at all
     (`Replica.groups()` returns `[]` for a degree-1 dimension, same as
     `enumerate_attn_shapes` at `attn_tp=1`) -- `ep_shape` is then always
-    `(1,)`, and the set of `attn_shape` values this function reaches is
-    identical to `enumerate_attn_shapes`'s own, built from the same
-    deployment shape, the same policies, the same seeds. This is what
-    keeps the `ffn_ep=1` case bit-identical to every call site that
-    predates this task (task 44's own acceptance requirement).
+    `(1,)`, `relative` is always `None`, and the set of `attn_shape`
+    values this function reaches is identical to `enumerate_attn_shapes`'s
+    own, built from the same deployment shape, the same policies, the
+    same seeds. This is what keeps the `ffn_ep=1` case bit-identical to
+    every call site that predates task 44 (its own acceptance
+    requirement, still honoured after task 57's own key change).
     """
     fabric = topology.fabric
     d = Deployment("joint-arrangement-probe")
@@ -699,20 +732,90 @@ def enumerate_joint_arrangements(topology: Topology, attn_tp: int, ffn_ep: int,
             except Exception:  # noqa: BLE001
                 pass
 
+    # Task 57: the two-domain analogue of the fallback above. With
+    # exactly two real domains (this project's own "two real machines"
+    # case, task 54/55/56), the >=3-domain fallback above never fires --
+    # it needs a third domain for prefill/the FFN anchor rank, separate
+    # from either group's own. Task 56 found that `fragmented()` *can*
+    # construct "attention whole on one domain, experts whole on the
+    # other" (seeds 3, 9, 49, confirmed live for the two degree pairs
+    # this project has tested), but only by luck; a different seed
+    # count, or a larger degree pair the random policy is less likely to
+    # stumble on, would lose it again silently. This constructs it
+    # deterministically instead, whenever both groups exist and each
+    # individually fits in one domain -- prefill packed alongside
+    # attention (the smaller, or equal, footprint) rather than needing
+    # its own domain, since only two are available.
+    if len(domain_ids) >= 2 and attn_group is not None and ep_group is not None:
+        if attn_tp <= domain_size and ffn_ep <= domain_size:
+            prefill_rank = d.replicas[0].ranks[0]
+            attn_domain_members = sorted(fabric.domains[domain_ids[0]].members)
+            ep_domain_members = sorted(fabric.domains[domain_ids[1]].members)
+            if attn_tp + 1 <= len(attn_domain_members):
+                mapping = {prefill_rank: attn_domain_members[0]}
+                for i, r in enumerate(attn_group.ranks):
+                    mapping[r] = attn_domain_members[i + 1]
+                for i, r in enumerate(ep_group.ranks):
+                    mapping[r] = ep_domain_members[i]
+                try:
+                    candidates.append(explicit(d, fabric, mapping))
+                except Exception:  # noqa: BLE001
+                    pass
+
     for seed in range(n_fragmented_seeds):
         try:
             candidates.append(fragmented(d, fabric, seed=seed))
         except Exception:  # noqa: BLE001
             pass
 
-    arrangements: Dict[Tuple[Tuple[int, ...], Tuple[int, ...]], object] = {}
+    arrangements: Dict[Tuple[Tuple[int, ...], Tuple[int, ...], Optional[str]], object] = {}
     for p in candidates:
         attn_shape = p.group_shape(attn_group) if attn_group is not None else (1,)
         ep_shape = p.group_shape(ep_group) if ep_group is not None else (1,)
-        key = (attn_shape, ep_shape)
+        relative = _relative_domain_placement(p, attn_group, ep_group)
+        key = (attn_shape, ep_shape, relative)
         if key not in arrangements:
             arrangements[key] = p
     return arrangements
+
+
+def _relative_domain_placement(placement, attn_group: Optional[object],
+                               ep_group: Optional[object]) -> Optional[str]:
+    """Task 57: `group_shape()` records how many ranks of *one* group
+    land in each domain, never which domain -- correct for a single
+    group (task 32's own original use, where one domain really is
+    interchangeable with another), wrong once two *different* groups are
+    enumerated together, where whether they share a domain is exactly
+    the thing a caller needs to tell apart. This is the third component
+    `enumerate_joint_arrangements`'s own key adds, deliberately not
+    folded into `group_shape()` itself -- `enumerate_attn_shapes` and
+    task 41's replica enumeration both still call `group_shape()`
+    directly and must not see this.
+
+    `None` when either group does not exist (`attn_tp=1` or `ffn_ep=1`)
+    -- there is nothing for "shared a domain" to mean with only one real
+    group, and `None` is this dataclass-free module's own established
+    idiom for "not applicable" (`Candidate.ep_shape` reads the same way
+    at `ffn_ep=1`). This is what keeps every single-group call's own
+    *set* of keys unchanged in substance (task 44's own bit-identical
+    requirement) even though each key's own arity grows by one.
+
+    Otherwise one of `"same"` (the two groups' own occupied-domain sets
+    are identical -- includes today's colocated arrangement, where both
+    are a single, shared domain, but is not limited to that case),
+    `"disjoint"` (no domain in common -- the arrangement task 55/56
+    found unreachable), or `"overlapping"` (neither -- one group's
+    domains are a strict subset of, or partially intersect, the
+    other's)."""
+    if attn_group is None or ep_group is None:
+        return None
+    attn_domains = placement.domains_spanned(attn_group.ranks)
+    ep_domains = placement.domains_spanned(ep_group.ranks)
+    if attn_domains == ep_domains:
+        return "same"
+    if not (attn_domains & ep_domains):
+        return "disjoint"
+    return "overlapping"
 
 
 # ------------------------------------------------------------------- plan()
@@ -877,17 +980,18 @@ def plan(topology: Topology, model: ModelSpec, workload: Workload, hardware: Har
             # docstring for why), which is what keeps every pre-task-44
             # call site (`ep_values` defaulting to `(1,)`) bit-identical.
             joint = enumerate_joint_arrangements(topology, attn_tp, ep)
-            for shape, ep_shape in joint:
+            for shape, ep_shape, relative in joint:
                 for attn_replicas, ffn_replicas in replica_ratios:
                     attn_dp_size = attn_dp_size_policy(attn_replicas, ffn_replicas)
                     if not lane_assignment_feasible(attn_replicas, ffn_replicas, attn_dp_size):
                         inadmissible.append(Inadmissible(
-                            f"tp{attn_tp}_shape{shape}_ep{ep}_epshape{ep_shape}"
+                            f"tp{attn_tp}_shape{shape}_ep{ep}_epshape{ep_shape}_rel{relative}"
                             f"_ar{attn_replicas}_fr{ffn_replicas}",
                             f"lane assignment: attn_replicas({attn_replicas})*attn_dp_size"
                             f"({attn_dp_size}) < ffn_replicas({ffn_replicas})"))
                         continue
-                    candidate = Candidate(attn_tp, shape, ep, ep_shape, attn_replicas, ffn_replicas)
+                    candidate = Candidate(attn_tp, shape, ep, ep_shape, attn_replicas, ffn_replicas,
+                                          relative=relative)
                     if not evaluator.can_evaluate(candidate):
                         unknown.append(Unknown(candidate.key,
                             "evaluator cannot price this candidate (outside its own coverage)"))

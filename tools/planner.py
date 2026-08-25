@@ -142,13 +142,16 @@ _RESULT_MARKER = "PLAN_EVAL_RESULT="
 
 
 def _placement_for(topology: Topology, deployment: Deployment, candidate: Candidate):
-    """`(candidate.attn_shape, candidate.ep_shape)`'s own reference
-    `Placement` (from `enumerate_joint_arrangements`, task 44) was built
-    for a unit deployment -- one PREFILL, one DECODE_ATTN replica at
-    this tp, one DECODE_FFN replica at this ep -- whose ranks are, by
-    construction, identical to this deployment's own replica-0 ranks
-    for each pool. Reused directly wherever a rank matches (bit-identical
-    to the reference for the base 1:1 case, matching task 32's own
+    """`(candidate.attn_shape, candidate.ep_shape, candidate.relative)`'s
+    own reference `Placement` (from `enumerate_joint_arrangements`, task
+    44; the third component added task 57, since the first two alone no
+    longer uniquely identify one placement -- the colocated and the
+    natural-split arrangements can share them) was built for a unit
+    deployment -- one PREFILL, one DECODE_ATTN replica at this tp, one
+    DECODE_FFN replica at this ep -- whose ranks are, by construction,
+    identical to this deployment's own replica-0 ranks for each pool.
+    Reused directly wherever a rank matches (bit-identical to the
+    reference for the base 1:1 case, matching task 32's own
     single-evaluation path exactly, and -- task 44's own extension --
     for replica-0's own expert-parallel ranks too, not just its tensor-
     parallel ones). Any rank the reference does not cover -- additional
@@ -160,7 +163,7 @@ def _placement_for(topology: Topology, deployment: Deployment, candidate: Candid
     covers directly).
     """
     joint = enumerate_joint_arrangements(topology, candidate.attn_tp, candidate.ffn_ep)
-    ref_placement = joint[(candidate.attn_shape, candidate.ep_shape)]
+    ref_placement = joint[(candidate.attn_shape, candidate.ep_shape, candidate.relative)]
     fabric = topology.fabric
     domain_ids = sorted(fabric.domains)
 
@@ -197,7 +200,8 @@ def _run_scenario(topology_name: str, model_name: str, candidate_key: str,
                   total_experts: int, router_topk: int, is_moe: bool,
                   hidden_size: int, num_attention_heads: int,
                   num_key_value_heads: int, num_layers: int, head_dim: Optional[int],
-                  seed: int, seeded: bool, decode_ffn_scheduler: str = "orca") -> None:
+                  seed: int, seeded: bool, decode_ffn_scheduler: str = "orca",
+                  relative: Optional[str] = None) -> None:
     topology = _TOPOLOGIES[topology_name]()
     model = ModelSpec(model_name, total_experts, router_topk, is_moe=is_moe,
                       hidden_size=hidden_size, num_attention_heads=num_attention_heads,
@@ -207,7 +211,8 @@ def _run_scenario(topology_name: str, model_name: str, candidate_key: str,
     hardware = Hardware(device, memory_margin)
     shape = tuple(int(x) for x in attn_shape.split(","))
     ep_shape_t = tuple(int(x) for x in ep_shape.split(","))
-    candidate = Candidate(attn_tp, shape, ffn_ep, ep_shape_t, attn_replicas, ffn_replicas)
+    candidate = Candidate(attn_tp, shape, ffn_ep, ep_shape_t, attn_replicas, ffn_replicas,
+                          relative=relative)
 
     d = Deployment("plan-eval")
     d.add(Replica(PoolKind.PREFILL, 0, tp=1))
@@ -310,7 +315,8 @@ def evaluate(topology: Topology, model: ModelSpec, workload: Workload, hardware:
          "--num-layers", str(model.num_layers),
          "--head-dim", str(model.head_dim) if model.head_dim is not None else "none",
          "--seed", str(seed), "--seeded", "1" if seeded else "0",
-         "--decode-ffn-scheduler", decode_ffn_scheduler],
+         "--decode-ffn-scheduler", decode_ffn_scheduler,
+         "--relative", candidate.relative if candidate.relative is not None else "none"],
         capture_output=True, text=True, cwd=str(FRONTIER_ROOT))
     for line in proc.stdout.splitlines():
         if line.startswith(_RESULT_MARKER):
@@ -587,9 +593,11 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seeded", type=int, default=0)
     parser.add_argument("--decode-ffn-scheduler", type=str, default="orca")
+    parser.add_argument("--relative", type=str, default="none")
     args = parser.parse_args()
     if args.topology is not None:
         head_dim = None if args.head_dim == "none" else int(args.head_dim)
+        relative = None if args.relative == "none" else args.relative
         _run_scenario(args.topology, args.model_name, args.candidate_key,
                      args.attn_tp, args.attn_shape, args.ffn_ep, args.ep_shape,
                      args.attn_replicas, args.ffn_replicas, args.num_blocks,
@@ -598,6 +606,7 @@ if __name__ == "__main__":
                      args.total_experts, args.router_topk, bool(args.is_moe),
                      args.hidden_size, args.num_attention_heads,
                      args.num_key_value_heads, args.num_layers, head_dim,
-                     args.seed, bool(args.seeded), args.decode_ffn_scheduler)
+                     args.seed, bool(args.seeded), args.decode_ffn_scheduler,
+                     relative)
         raise SystemExit(0)
     raise SystemExit(0)

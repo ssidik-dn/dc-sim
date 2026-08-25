@@ -38,6 +38,7 @@ from planner_core import (  # noqa: E402
     enumerate_joint_arrangements,
 )
 from engine.physical.builders import build_node_scale  # noqa: E402
+from engine.logical.deployment import Deployment, PoolKind, Replica, ParallelKind  # noqa: E402
 
 _PLANNER_CORE_PATH = Path(__file__).resolve().parent.parent / "tools" / "planner_core.py"
 
@@ -507,11 +508,12 @@ def test_enumerate_joint_arrangements_at_ep1_matches_enumerate_attn_shapes():
     trivial `(1,)` ep_shape, must be exactly what `enumerate_attn_shapes`
     alone already reports. This is the literal check behind task 44's
     own acceptance requirement: the single-expert-group case must not
-    move."""
+    move. `relative` is `None` throughout (task 57) -- there is no
+    second group for "shares a domain" to mean anything about."""
     topology = _wide_topology()
     single = enumerate_attn_shapes(topology, attn_tp=2)
     joint = enumerate_joint_arrangements(topology, attn_tp=2, ffn_ep=1)
-    assert set(joint.keys()) == {(shape, (1,)) for shape in single.keys()}
+    assert set(joint.keys()) == {(shape, (1,), None) for shape in single.keys()}
 
 
 def test_enumerate_joint_arrangements_reaches_the_fully_packed_pair_when_it_fits():
@@ -520,34 +522,47 @@ def test_enumerate_joint_arrangements_reaches_the_fully_packed_pair_when_it_fits
     must be reachable -- the same "packed-if-it-fits" guarantee task 32
     established for a single group, extended here to two groups placed
     at once (task 44's own S2: enumerated together, not assumed
-    independent and combined afterward)."""
+    independent and combined afterward). `relative="disjoint"` (task 57):
+    each domain here holds only 4 GPUs, so attention (tp=4) and experts
+    (ep=4) cannot both be whole in the *same* domain -- the >=3-domain
+    fallback that reaches this puts attention in its own domain and
+    experts in a separate third one, deliberately (its own comment:
+    the expert group gets "its own third domain, not just the attention
+    group in its own second one"). This is the arrangement the
+    `packed-if-it-fits` guarantee was always describing -- Task 57 only
+    makes its *relative* placement nameable, not new behaviour."""
     topology = _three_domain_topology()
     joint = enumerate_joint_arrangements(topology, attn_tp=4, ffn_ep=4)
-    assert ((4,), (4,)) in joint
+    assert ((4,), (4,), "disjoint") in joint
 
 
 def test_enumerate_joint_arrangements_keys_are_ordered_pairs_not_multisets():
     """The known trap this task's own S6 names: an attention group and
-    an expert group are not interchangeable, so the canonical key must
-    be an ordered pair, `(attn_shape, ep_shape)` -- never sorted
-    together the way `enumerate_replica_arrangements`'s own multiset
-    key sorts two *attention* replicas' shapes against each other."""
+    an expert group are not interchangeable, so the canonical key's own
+    shape components must be an ordered pair, `(attn_shape, ep_shape)`
+    -- never sorted together the way `enumerate_replica_arrangements`'s
+    own multiset key sorts two *attention* replicas' shapes against
+    each other. The key is a 3-tuple as of task 57 (the third component,
+    `relative`, is not itself an ordering question -- it names whether
+    the two groups share a domain, not which shape belongs to which
+    role)."""
     topology = _three_domain_topology()
     joint = enumerate_joint_arrangements(topology, attn_tp=4, ffn_ep=2)
-    for attn_shape, ep_shape in joint:
-        # every key is a 2-tuple of (attn_shape, ep_shape) in that fixed
-        # role order -- unlike a multiset key, swapping the two would be
-        # a different, meaningless pairing (an attention shape is never
-        # interchangeable with an expert-group shape), so nothing here
-        # sorts attn_shape and ep_shape against each other.
+    for attn_shape, ep_shape, relative in joint:
+        # every key's first two components are (attn_shape, ep_shape) in
+        # that fixed role order -- unlike a multiset key, swapping the
+        # two would be a different, meaningless pairing (an attention
+        # shape is never interchangeable with an expert-group shape), so
+        # nothing here sorts attn_shape and ep_shape against each other.
         assert isinstance(attn_shape, tuple) and isinstance(ep_shape, tuple)
+        assert relative in ("same", "disjoint", "overlapping")
     # the two roles have different reachable shape sets at (attn_tp=4,
     # ffn_ep=2) -- attn_shape can be (4,)/(3,1)/... (S=5, task 32's own
     # table); ep_shape can only be (2,)/(1,1) (S=2) -- so an ordered-pair
     # key is not merely a stylistic choice here, the two axes are not
     # even the same size.
-    attn_shapes_seen = {a for a, _ in joint}
-    ep_shapes_seen = {e for _, e in joint}
+    attn_shapes_seen = {a for a, _, _ in joint}
+    ep_shapes_seen = {e for _, e, _ in joint}
     assert len(attn_shapes_seen) >= len(ep_shapes_seen)
 
 
@@ -557,8 +572,184 @@ def test_enumerate_joint_arrangements_collapses_raw_candidates():
     smaller set of distinct (attn_shape, ep_shape) pairs."""
     topology = _three_domain_topology()
     joint = enumerate_joint_arrangements(topology, attn_tp=4, ffn_ep=4, n_fragmented_seeds=60)
-    raw_candidates = 2 + 1 + 60  # packed + spread + the explicit fallback + 60 fragmented
+    # packed + spread + the >=3-domain explicit fallback + the task 57
+    # 2-domain explicit fallback (both groups fit a domain here, so it
+    # fires on this 3-domain fabric too) + 60 fragmented
+    raw_candidates = 2 + 1 + 1 + 60
     assert len(joint) < raw_candidates
+
+
+# ------------------------------- the natural split (task 55/56/57) ---------
+
+
+def _two_real_machines_topology():
+    """Two conventional 8-GPU nodes -- the exact topology task 54/55/56
+    used for the hardware-validation forcing configuration, and the one
+    on which task 56 found "attention whole on one machine, experts
+    whole on the other" unreachable."""
+    fabric = build_node_scale(num_machines=2, gpus_per_machine=8,
+                              scale_up_GBps=400.0, scale_out_GBps=50.0)
+    return Topology(fabric, "two-real-machines-test-fabric")
+
+
+@pytest.mark.parametrize("attn_tp,ffn_ep,attn_shape,ep_shape", [
+    (4, 2, (4,), (2,)),
+    (2, 4, (2,), (4,)),
+])
+def test_natural_split_is_reachable(attn_tp, ffn_ep, attn_shape, ep_shape):
+    """The regression this task exists to prevent: task 56 established
+    that neither `(4,2)` nor `(2,4)` could reach "attention whole on one
+    machine, experts whole on the other" -- `group_shape()`'s own
+    domain-blind signature collapsed it into the colocated arrangement's
+    key, and `packed`/`spread` never construct it at all when the joint
+    footprint fits one domain. After task 57's `relative` component, it
+    must be present, distinct from the colocated arrangement, and
+    genuinely on two different domains -- not merely present in the
+    dict under some key, which the old 2-tuple key already guaranteed
+    for the *colocated* one."""
+    topology = _two_real_machines_topology()
+    joint = enumerate_joint_arrangements(topology, attn_tp=attn_tp, ffn_ep=ffn_ep)
+
+    split_key = (attn_shape, ep_shape, "disjoint")
+    colocated_key = (attn_shape, ep_shape, "same")
+    assert split_key in joint, f"natural split {split_key} not reachable"
+    assert colocated_key in joint, f"colocated {colocated_key} not reachable"
+    assert joint[split_key] is not joint[colocated_key]
+
+    d = joint[split_key].fabric
+    # Re-derive the groups the same way enumerate_joint_arrangements
+    # itself does, to check the *placement* this key actually resolved
+    # to, not only the label under which it was stored.
+    deployment = Deployment("natural-split-check")
+    deployment.add(Replica(PoolKind.PREFILL, 0, tp=1))
+    deployment.add(Replica(PoolKind.DECODE_ATTN, 0, tp=attn_tp))
+    deployment.add(Replica(PoolKind.DECODE_FFN, 0, tp=1, ep=ffn_ep))
+    attn_group = deployment.pool(PoolKind.DECODE_ATTN)[0].groups(ParallelKind.TP)[0]
+    ep_group = deployment.pool(PoolKind.DECODE_FFN)[0].groups(ParallelKind.EP)[0]
+
+    split_placement = joint[split_key]
+    attn_domains = split_placement.domains_spanned(attn_group.ranks)
+    ep_domains = split_placement.domains_spanned(ep_group.ranks)
+    assert len(attn_domains) == 1
+    assert len(ep_domains) == 1
+    assert attn_domains != ep_domains, "the 'split' key did not resolve to different domains"
+
+
+def test_natural_split_does_not_change_the_colocated_arrangement():
+    """The fix must add a candidate, not replace one -- the colocated
+    arrangement `packed()` already found must still be exactly
+    reachable under its own, now-disambiguated key."""
+    topology = _two_real_machines_topology()
+    joint = enumerate_joint_arrangements(topology, attn_tp=4, ffn_ep=2)
+    colocated = joint[((4,), (2,), "same")]
+    deployment = Deployment("colocated-check")
+    deployment.add(Replica(PoolKind.PREFILL, 0, tp=1))
+    deployment.add(Replica(PoolKind.DECODE_ATTN, 0, tp=4))
+    deployment.add(Replica(PoolKind.DECODE_FFN, 0, tp=1, ep=2))
+    attn_group = deployment.pool(PoolKind.DECODE_ATTN)[0].groups(ParallelKind.TP)[0]
+    ep_group = deployment.pool(PoolKind.DECODE_FFN)[0].groups(ParallelKind.EP)[0]
+    assert colocated.domains_spanned(attn_group.ranks) == colocated.domains_spanned(ep_group.ranks)
+
+
+def test_relative_is_none_when_either_group_is_absent():
+    """`relative` names a relationship between *two* groups -- at
+    `attn_tp=1` or `ffn_ep=1`, only one exists, and the question does
+    not apply. `None`, not some other sentinel, matching
+    `Candidate.relative`'s own default (so an unextended caller's own
+    `Candidate(...)` -- no `relative` passed -- still looks up correctly)."""
+    topology = _two_real_machines_topology()
+    joint_ep1 = enumerate_joint_arrangements(topology, attn_tp=4, ffn_ep=1)
+    assert all(relative is None for _, _, relative in joint_ep1)
+    joint_tp1 = enumerate_joint_arrangements(topology, attn_tp=1, ffn_ep=4)
+    assert all(relative is None for _, _, relative in joint_tp1)
+
+
+def test_relative_domain_placement_classifies_same_disjoint_overlapping():
+    """`_relative_domain_placement`'s own three-way classification,
+    checked directly against real placements rather than only through
+    `enumerate_joint_arrangements`'s own end-to-end behaviour."""
+    from planner_core import _relative_domain_placement
+    from engine.placement.placement import explicit
+
+    topology = _two_real_machines_topology()
+    fabric = topology.fabric
+    d = Deployment("relative-check")
+    d.add(Replica(PoolKind.PREFILL, 0, tp=1))
+    d.add(Replica(PoolKind.DECODE_ATTN, 0, tp=2))
+    d.add(Replica(PoolKind.DECODE_FFN, 0, tp=1, ep=2))
+    attn_group = d.pool(PoolKind.DECODE_ATTN)[0].groups(ParallelKind.TP)[0]
+    ep_group = d.pool(PoolKind.DECODE_FFN)[0].groups(ParallelKind.EP)[0]
+    prefill_rank = d.replicas[0].ranks[0]
+    m0 = sorted(fabric.domains[0].members)
+    m1 = sorted(fabric.domains[1].members)
+
+    same = explicit(d, fabric, {
+        prefill_rank: m0[0], attn_group.ranks[0]: m0[1], attn_group.ranks[1]: m0[2],
+        ep_group.ranks[0]: m0[3], ep_group.ranks[1]: m0[4],
+    })
+    assert _relative_domain_placement(same, attn_group, ep_group) == "same"
+
+    disjoint = explicit(d, fabric, {
+        prefill_rank: m0[0], attn_group.ranks[0]: m0[1], attn_group.ranks[1]: m0[2],
+        ep_group.ranks[0]: m1[0], ep_group.ranks[1]: m1[1],
+    })
+    assert _relative_domain_placement(disjoint, attn_group, ep_group) == "disjoint"
+
+    overlapping = explicit(d, fabric, {
+        prefill_rank: m0[0], attn_group.ranks[0]: m0[1], attn_group.ranks[1]: m1[0],
+        ep_group.ranks[0]: m0[2], ep_group.ranks[1]: m0[3],
+    })
+    assert _relative_domain_placement(overlapping, attn_group, ep_group) == "overlapping"
+
+    assert _relative_domain_placement(same, None, ep_group) is None
+    assert _relative_domain_placement(same, attn_group, None) is None
+
+
+def test_natural_split_prices_where_task_56_predicted():
+    """Task 56 priced the split placement by hand (bypassing
+    `_placement_for`, which could not reach it) and found it second,
+    behind the colocated winner by 20.3% (`4,2`) and 23.8% (`2,4`). This
+    is the same check run through the real, now-fixed path -- if the
+    fix resolves to a *different* physical placement than task 56 hand-
+    built, the margin would not match, and that would mean the fix
+    introduced a new placement rather than making the existing one
+    reachable. Deliberately marked slow/real-compute -- this calls the
+    real evaluator, matching the acceptance bar's own "run, not argue"
+    instruction (task 57 S3.4) -- kept in the suite since the check is
+    cheap for this model."""
+    import subprocess
+    import sys as _sys
+    from pathlib import Path
+
+    frontier_root = Path("/work/simulation/Frontier")
+    if not frontier_root.is_dir():
+        pytest.skip("needs Frontier checked out at /work/simulation/Frontier")
+
+    import json
+
+    script = Path(__file__).resolve().parent / "_natural_split_pricing_probe.py"
+    marker = "NATURAL_SPLIT_PROBE_RESULT="
+
+    def _price(attn_tp: int, ffn_ep: int, relative: str) -> float:
+        proc = subprocess.run(
+            [_sys.executable, str(script), "--attn-tp", str(attn_tp), "--ffn-ep", str(ffn_ep),
+             "--relative", relative],
+            capture_output=True, text=True, cwd=str(frontier_root))
+        line = next((l for l in proc.stdout.splitlines() if l.startswith(marker)), None)
+        assert line is not None, (
+            f"probe failed (attn_tp={attn_tp}, ffn_ep={ffn_ep}, relative={relative}, "
+            f"exit={proc.returncode}):\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}")
+        return json.loads(line[len(marker):])["mean_tpot_ms"]
+
+    for attn_tp, ffn_ep, expected_margin_pct in [(4, 2, 20.3), (2, 4, 23.8)]:
+        colocated_mean = _price(attn_tp, ffn_ep, "same")
+        split_mean = _price(attn_tp, ffn_ep, "disjoint")
+        assert colocated_mean < split_mean, (
+            "colocated must still win -- task 56's own finding for these two points")
+        margin_pct = (split_mean - colocated_mean) / colocated_mean * 100.0
+        assert margin_pct == pytest.approx(expected_margin_pct, abs=0.2), (
+            f"attn_tp={attn_tp}, ffn_ep={ffn_ep}: margin {margin_pct:.2f}% != "
+            f"task 56's own predicted {expected_margin_pct}%")
 
 
 # ------------------------------------------------- plan() with expert placement
