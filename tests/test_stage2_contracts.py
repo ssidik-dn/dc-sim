@@ -15,6 +15,7 @@ already established.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -40,7 +41,7 @@ from stage2.validators import (  # noqa: E402
     is_eligible_for_hardware_best, validate_deployment_manifest,
     validate_hardware_result, validate_manifest_prediction_pair, validate_placement,
     validate_runtime_status_is_not_planner_feasibility, validate_workload_spec,
-    ValidationError,
+    validate_workload_and_constraints_consistency, ValidationError,
 )
 from stage2.decision import compute_decision_validation, compute_hardware_best  # noqa: E402
 
@@ -219,6 +220,106 @@ def test_minor_version_bump_is_accepted():
 def test_validate_deployment_manifest_end_to_end():
     manifest = _minimal_manifest()
     validate_deployment_manifest(manifest, expected_version=DEPLOYMENT_MANIFEST_VERSION)
+
+
+# --------------------------------------------------------------------------
+# workload/constraints two-sources-of-truth consistency (Gate A.1)
+# --------------------------------------------------------------------------
+
+
+def _with_divergent_input_identity_workload(manifest: DeploymentManifest, **overrides) -> DeploymentManifest:
+    """Simulates a hand-edited or corrupted JSON file where the two
+    copies disagree -- `export_deployment_manifest` itself always
+    builds both from the same object, so this bypasses that guarantee
+    on purpose, the same way a real `sim_real`-side JSON parse would
+    have no such guarantee at all."""
+    divergent_workload = dataclasses.replace(manifest.input_identity.workload, **overrides)
+    divergent_identity = dataclasses.replace(manifest.input_identity, workload=divergent_workload)
+    return dataclasses.replace(manifest, input_identity=divergent_identity)
+
+
+def _with_divergent_input_identity_constraints(manifest: DeploymentManifest, **overrides) -> DeploymentManifest:
+    divergent_constraints = dataclasses.replace(manifest.input_identity.constraints, **overrides)
+    divergent_identity = dataclasses.replace(manifest.input_identity, constraints=divergent_constraints)
+    return dataclasses.replace(manifest, input_identity=divergent_identity)
+
+
+def test_identical_duplicated_workload_is_accepted():
+    manifest = _minimal_manifest()
+    validate_workload_and_constraints_consistency(manifest)  # must not raise
+
+
+def test_differing_regime_between_the_two_workload_copies_is_rejected():
+    manifest = _minimal_manifest()
+    divergent = _with_divergent_input_identity_workload(
+        manifest, regime=WorkloadSpecRef.STREAMING, qps=4.0, seed=0, num_seeds=3)
+    with pytest.raises(ValidationError, match="workload"):
+        validate_workload_and_constraints_consistency(divergent)
+
+
+def test_differing_qps_seed_or_request_count_is_rejected():
+    manifest = _minimal_manifest()
+    for overrides in [{"num_requests": 999}, {"prefill_tokens": 1}, {"decode_tokens": 1}]:
+        divergent = _with_divergent_input_identity_workload(manifest, **overrides)
+        with pytest.raises(ValidationError, match="workload"):
+            validate_workload_and_constraints_consistency(divergent)
+
+
+def test_identical_duplicated_constraints_is_accepted():
+    manifest = _minimal_manifest()
+    validate_workload_and_constraints_consistency(manifest)  # covers constraints too
+
+
+def test_differing_memory_margin_between_the_two_constraints_copies_is_rejected():
+    manifest = _minimal_manifest()
+    divergent = _with_divergent_input_identity_constraints(manifest, memory_margin_fraction=0.5)
+    with pytest.raises(ValidationError, match="constraints"):
+        validate_workload_and_constraints_consistency(divergent)
+
+
+def test_differing_slo_between_the_two_constraints_copies_is_rejected():
+    manifest = _minimal_manifest()
+    divergent = _with_divergent_input_identity_constraints(manifest, slo_tpot_ms=1.0)
+    with pytest.raises(ValidationError, match="constraints"):
+        validate_workload_and_constraints_consistency(divergent)
+
+
+def test_differing_throughput_floor_mode_or_baseline_is_rejected():
+    manifest = _minimal_manifest()
+    divergent_value = _with_divergent_input_identity_constraints(
+        manifest, throughput_floor=ThroughputFloor(mode=ThroughputFloor.ABSOLUTE, value=999.0))
+    with pytest.raises(ValidationError, match="constraints"):
+        validate_workload_and_constraints_consistency(divergent_value)
+
+    divergent_mode = _with_divergent_input_identity_constraints(
+        manifest, throughput_floor=ThroughputFloor(mode=ThroughputFloor.RELATIVE_TO_BASELINE,
+                                                    value=0.0, baseline_candidate_id="c0"))
+    with pytest.raises(ValidationError, match="constraints"):
+        validate_workload_and_constraints_consistency(divergent_mode)
+
+
+def test_divergent_workload_is_rejected_by_the_full_manifest_validator_too():
+    manifest = _minimal_manifest()
+    divergent = _with_divergent_input_identity_workload(manifest, num_requests=1)
+    with pytest.raises(ValidationError):
+        validate_deployment_manifest(divergent, expected_version=DEPLOYMENT_MANIFEST_VERSION)
+
+
+def test_divergence_survives_a_json_round_trip_and_is_still_caught():
+    """The consistency check must run against what a real consumer
+    actually has -- a deserialized JSON payload, not the in-memory
+    object graph that happened to be built consistently."""
+    manifest = _minimal_manifest()
+    divergent = _with_divergent_input_identity_constraints(manifest, slo_tpot_ms=1.0)
+    restored = from_json(DeploymentManifest, to_json(divergent))
+    with pytest.raises(ValidationError):
+        validate_workload_and_constraints_consistency(restored)
+
+
+def test_consistent_manifest_json_round_trip_remains_valid():
+    manifest = _minimal_manifest()
+    restored = from_json(DeploymentManifest, to_json(manifest))
+    validate_deployment_manifest(restored, expected_version=DEPLOYMENT_MANIFEST_VERSION)  # must not raise
 
 
 def test_missing_required_field_is_a_hard_reject_not_a_silent_default():
@@ -445,6 +546,47 @@ def test_profile_provenance_files_commit_and_fix_flags_round_trip():
     assert restored.profile_provenance.block_table_fix_applied is False
 
 
+@pytest.mark.parametrize("phase_filter_applied", [True, False, None])
+@pytest.mark.parametrize("block_table_fix_applied", [True, False, None])
+def test_profile_provenance_tri_state_flags_survive_json_round_trip_distinctly(
+    phase_filter_applied, block_table_fix_applied):
+    """Gate A.1: re-verifies, not redesigns, Gate A's own tri-state
+    contract (`docs/stage-2-gate-a-contract-report.md` §1/§9):
+    `True`/`False`/`None` on `phase_filter_applied`/`block_table_fix_applied`
+    must remain three distinct values through a full JSON round trip --
+    `None` must never become `False`, and `False` (checked, confirmed
+    not applied) must never become `None` (unchecked). All 9
+    combinations of the two flags are checked, not just one each."""
+    prov = ProfileProvenance(
+        profile_files=("attention.csv",), device="h800", model="m",
+        operator_families_covered=("attention",),
+        phase_filter_applied=phase_filter_applied, block_table_fix_applied=block_table_fix_applied,
+    )
+    restored = from_json(ProfileProvenance, to_json(prov))
+    assert restored.phase_filter_applied is phase_filter_applied
+    assert restored.block_table_fix_applied is block_table_fix_applied
+
+
+def test_profile_provenance_none_is_not_coerced_to_false_inside_a_full_manifest():
+    """The same check, but through the full `DeploymentManifest` object
+    graph (not `ProfileProvenance` in isolation) -- catches a bug where
+    a generic serializer's own `Optional[bool]` handling collapses
+    `None` to a JSON `false` rather than JSON `null`, which a
+    field-in-isolation test could miss if the manifest-level dataclass
+    reconstruction path treated the two differently."""
+    manifest = _minimal_manifest()
+    unproven = ProfileProvenance(profile_files=("f.csv",), device="h800", model="m",
+                                 operator_families_covered=("linear_op",),
+                                 phase_filter_applied=None, block_table_fix_applied=None)
+    manifest = DeploymentManifest(**{**manifest.__dict__, "profile_provenance": unproven})
+    raw = json.loads(to_json(manifest))
+    assert raw["profile_provenance"]["phase_filter_applied"] is None
+    assert raw["profile_provenance"]["block_table_fix_applied"] is None
+    restored = from_json(DeploymentManifest, to_json(manifest))
+    assert restored.profile_provenance.phase_filter_applied is None
+    assert restored.profile_provenance.block_table_fix_applied is None
+
+
 def test_placement_mapping_with_int_machine_keys_round_trips():
     manifest = _minimal_manifest()
     restored = from_json(DeploymentManifest, to_json(manifest))
@@ -479,6 +621,21 @@ def test_two_host_tp4_example_validates():
     assert manifest.parallelism.attn_tp == 4
     assert manifest.parallelism.attn_shape == (2, 2)
     assert len(manifest.placement.domains_used()) == 2
+
+
+def test_interval_example_manifest_validates_end_to_end():
+    """Gate A.1 regression check: this manifest's own `workload.seed`
+    was `None` under a streaming regime (a real, pre-existing gap this
+    task's own regression pass caught -- `validate_workload_spec`
+    already required it, but nothing had run this specific example
+    through `validate_deployment_manifest` before). Fixed to `seed=0`,
+    the real starting point of `SimulationEvaluator`'s own
+    `range(num_seeds)` seed sequence, alongside the already-correct
+    `num_seeds=3` -- not a claim that only one seed ran."""
+    manifest = _load_example_manifest("planner_prediction_with_interval")
+    validate_deployment_manifest(manifest, expected_version=DEPLOYMENT_MANIFEST_VERSION)
+    assert manifest.workload.seed == 0
+    assert manifest.workload.num_seeds == 3
 
 
 def test_interval_example_carries_a_real_measured_ci95_halfwidth():

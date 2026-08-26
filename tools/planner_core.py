@@ -82,6 +82,35 @@ class ModelSpec:
     # chooses) -- this is what `SimulationEvaluator.can_evaluate` reads,
     # a fact about the profile data, not a search-scope decision.
     profiled_tp: Tuple[int, ...] = (1, 2, 4, 8)
+    # Stage 2 Gate A.1: the `ffn_ep` analogue of `profiled_tp` -- but,
+    # checked directly against every real `moe.csv` in this checkout
+    # (`data/profiling/compute/*/*/moe.csv`), **not the same constant**.
+    # `profiled_tp` is `(1, 2, 4, 8)` for every model on every device
+    # this project has real profiles for (Task 35's own finding, still
+    # true). `expert_parallel_size` coverage is not: `mixtral_8x7b_moe`
+    # (a100) is profiled at ep=(1,) only despite `num_experts=8`;
+    # `qwen2_moe_example` (a100) at ep=(1,2); `qwen3-next-80b-a3b...`
+    # is ep=(1,) on a800 but ep=(1,2,4,8) on h800, the same model on two
+    # devices; `rtx_pro_6000/Qwen3-30B-A3B-tiny` is ep=(1,) only. This
+    # is a real, per-(model, device) fact, not a search-scope choice --
+    # defaulting it to `profiled_tp`'s own `(1,2,4,8)` would silently
+    # claim coverage several real profiles in this checkout do not have.
+    #
+    # Defaults to `(1,)`, the one value present in every real `moe.csv`
+    # this checkout has (`ffn_ep=1` needs no expert-parallel group at
+    # all) -- this is what keeps every existing caller that never sets
+    # `ffn_ep` above 1 unaffected. A caller whose search reaches
+    # `ffn_ep > 1` against a real `SimulationEvaluator` must supply the
+    # real grid for their own (model, device) explicitly; see
+    # `sklearn_moe_execution_time_predictor.py`'s own
+    # `_get_profiling_metadata` (`frontier/execution_time_predictor/`) for
+    # where that grid actually comes from at training time -- it filters
+    # `moe.csv` to `(num_tensor_parallel_workers, expert_parallel_size)`
+    # pairs matching this model's own `num_experts`/`router_topk`/
+    # `hidden_dim`/`expert_hidden_dim`, and raises `ValueError` before
+    # training (not a silent extrapolation, and not a clean per-candidate
+    # `Unknown`) when the requested pair has no matching rows.
+    profiled_ep: Tuple[int, ...] = (1,)
     # Task 39 Part B: Frontier reads a KV head count and a head size
     # *twice*, for two different purposes, and they are not always the
     # same field. `ParamCounter` (parameter memory, `attn_param_mem_bytes`

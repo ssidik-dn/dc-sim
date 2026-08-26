@@ -75,10 +75,43 @@ def validate_placement(placement: PlacementSpec) -> None:
                 f"topology_machine_to_host's own values {sorted(known_hosts)}")
 
 
+def validate_workload_and_constraints_consistency(manifest: DeploymentManifest) -> None:
+    """Stage 2 Gate A.1: `DeploymentManifest` deliberately carries
+    `workload`/`constraints` twice -- once at the top level, once inside
+    `input_identity` (`docs/stage-2-gate-a-contract-report.md` §3's own
+    "redundancy with a stated purpose"). A manifest is only ever
+    produced by one exporter call in this project (`export_deployment_manifest`
+    builds both copies from the same real objects in one pass), so the
+    two copies cannot diverge *from this project's own producer*. But
+    `sim_real` receives JSON, not the in-memory Python objects that
+    guaranteed that -- nothing stops a hand-edited or corrupted file
+    from carrying two different answers to "what workload is this,"
+    and a consumer that silently picked one copy over the other would
+    make that divergence invisible instead of a hard failure.
+
+    Equality here is **semantic** (Python's own dataclass `__eq__`,
+    comparing every field by value, recursively through `ThroughputFloor`),
+    not object identity -- two separately-constructed but field-identical
+    `WorkloadSpecRef`/`ConstraintSpec` instances must pass; the two
+    copies literally cannot be the same object once a manifest has gone
+    through a JSON round trip regardless (`from_dict` builds two fresh
+    instances from a `dict`), so an identity check here would always
+    fail and would not be checking the thing that matters."""
+    if manifest.workload != manifest.input_identity.workload:
+        raise ValidationError(
+            f"DeploymentManifest.workload != input_identity.workload -- two sources of "
+            f"truth disagree: {manifest.workload!r} vs. {manifest.input_identity.workload!r}")
+    if manifest.constraints != manifest.input_identity.constraints:
+        raise ValidationError(
+            f"DeploymentManifest.constraints != input_identity.constraints -- two sources "
+            f"of truth disagree: {manifest.constraints!r} vs. {manifest.input_identity.constraints!r}")
+
+
 def validate_deployment_manifest(manifest: DeploymentManifest, *, expected_version: str) -> None:
     check_major_version("DeploymentManifest", manifest.manifest_version, expected_version)
     validate_workload_spec(manifest.workload)
     validate_placement(manifest.placement)
+    validate_workload_and_constraints_consistency(manifest)
     if not manifest.plan_id:
         raise ValidationError("DeploymentManifest.plan_id must not be empty")
     if not manifest.candidate_id:

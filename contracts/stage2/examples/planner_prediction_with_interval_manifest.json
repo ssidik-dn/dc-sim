@@ -35,7 +35,7 @@
       "prefill_tokens": 128,
       "decode_tokens": 32,
       "qps": 4.0,
-      "seed": null,
+      "seed": 0,
       "num_seeds": 3,
       "workload_identity": null
     },
@@ -117,7 +117,7 @@
     "prefill_tokens": 128,
     "decode_tokens": 32,
     "qps": 4.0,
-    "seed": null,
+    "seed": 0,
     "num_seeds": 3,
     "workload_identity": null
   },
@@ -159,6 +159,6 @@
     "planner_git_sha": "unknown-sandbox",
     "simulator_git_sha": null,
     "topology_id": "5a79a8b3bd4d8f1e",
-    "seed": null
+    "seed": 0
   }
 }

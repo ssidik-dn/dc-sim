@@ -26,7 +26,7 @@ import statistics
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from planner_core import (  # noqa: E402
@@ -48,6 +48,52 @@ from integration.install import install  # noqa: E402
 
 FRONTIER_ROOT = Path("/work/simulation/Frontier")
 _SCRIPT_PATH = str(Path(__file__).resolve())
+
+
+# ---------------------------------------------------- profiled_ep discovery
+
+
+def discover_profiled_ep(device: str, model_name: str, *, num_experts: int,
+                         router_topk: int, hidden_dim: int,
+                         frontier_root: Path = FRONTIER_ROOT) -> Tuple[int, ...]:
+    """Reads `data/profiling/compute/<device>/<model_name>/moe.csv`
+    directly and returns the distinct `expert_parallel_size` values
+    present for rows matching `num_experts`/`router_topk`/`hidden_dim` --
+    a convenience discovery tool for setting `ModelSpec.profiled_ep`
+    correctly, not something `can_evaluate` calls itself (that would
+    mean a subprocess reading a CSV file on every candidate check; the
+    gate reads the already-set tuple instead, exactly like `profiled_tp`).
+
+    **Approximate, by one real column.** Frontier's own dataset-contract
+    check (`sklearn_moe_execution_time_predictor.py`'s own
+    `_get_profiling_metadata`) filters on four columns:
+    `num_experts`/`router_topk`/`hidden_dim`/`expert_hidden_dim`. This
+    function only filters on the first three, because `planner_core.ModelSpec`
+    does not carry an `expert_hidden_dim`/`mlp_hidden_dim` field today.
+    Checked directly against every real `moe.csv` in this checkout
+    (Stage 2 Gate A.1): no file mixes two different `expert_hidden_dim`
+    values under the same `(num_experts, router_topk, hidden_dim)` triple,
+    so this is unambiguous for every model this project has real profiles
+    for -- but it is not a structural guarantee, and a caller adding a
+    new profile with such a mix would get a silently wider answer than
+    Frontier's own check would actually accept. Raises `FileNotFoundError`
+    if the CSV does not exist, and `ValueError` if no row matches."""
+    import csv
+    csv_path = frontier_root / "data" / "profiling" / "compute" / device / model_name / "moe.csv"
+    if not csv_path.exists():
+        raise FileNotFoundError(f"no moe.csv for device={device!r} model={model_name!r}: {csv_path}")
+    eps = set()
+    with open(csv_path) as f:
+        for row in csv.DictReader(f):
+            if (int(row["num_experts"]) == num_experts
+                   and int(row["router_topk"]) == router_topk
+                   and int(row["hidden_dim"]) == hidden_dim):
+                eps.add(int(row["expert_parallel_size"]))
+    if not eps:
+        raise ValueError(
+            f"no moe.csv row in {csv_path} matches num_experts={num_experts}, "
+            f"router_topk={router_topk}, hidden_dim={hidden_dim}")
+    return tuple(sorted(eps))
 
 
 # --------------------------------------------------------------- evaluation
@@ -363,6 +409,21 @@ class SimulationEvaluator:
     already-running multi-replica deployment) would not necessarily
     share this limit.
 
+    Stage 2 Gate A.1: `can_evaluate` also gates `candidate.ffn_ep`
+    against `self.model.profiled_ep`, exactly mirroring the `attn_tp`/
+    `profiled_tp` gate above -- added because the un-gated version let
+    an `ffn_ep` outside the real profiled grid proceed all the way into
+    a live Frontier subprocess, where `sklearn_moe_execution_time_predictor.py`'s
+    own dataset-contract check (`_get_profiling_metadata`,
+    `frontier/execution_time_predictor/`) raises a bare `ValueError`
+    before training -- surfacing to this project's own `evaluate()` as a
+    generic `{"error": "no result (exit code 1)"}`, which `plan()` would
+    then record as a `Rejection` ("evaluation error: ..."), conflating
+    "this evaluator does not know" with "this configuration is bad,"
+    exactly what `Unknown` exists to keep separate (Task 37's own
+    design). `ModelSpec.profiled_ep` defaults to `(1,)`, so this gate is
+    a no-op for every existing call site that never asks for `ffn_ep > 1`.
+
     `ffn_replicas > 1` is, despite first appearances, NOT similarly
     restricted -- an earlier version of this finding believed it was,
     from a probe that ran several evaluations in one Python process and
@@ -389,7 +450,9 @@ class SimulationEvaluator:
         self.regime = regime if regime is not None else Regime(seeded=False, num_seeds=1)
 
     def can_evaluate(self, candidate: Candidate) -> bool:
-        return candidate.attn_tp in self.model.profiled_tp and candidate.attn_replicas == 1
+        return (candidate.attn_tp in self.model.profiled_tp
+               and candidate.attn_replicas == 1
+               and candidate.ffn_ep in self.model.profiled_ep)
 
     def evaluate(self, candidate: Candidate) -> dict:
         num_blocks = feasible_num_blocks(self.model, self.hardware, candidate.attn_tp)
