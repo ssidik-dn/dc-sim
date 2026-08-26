@@ -1,0 +1,43 @@
+{
+  "planner_prediction_version": "1.0",
+  "plan_id": "stage2-example-attn_a_ffn_b",
+  "selected_manifest_id": "stage2-example-attn_a_ffn_b",
+  "candidate_id": "tp4_shape4_ep2_epshape2_reldisjoint_ar1_fr1",
+  "predicted": {
+    "objective_value": 5.409259642841263,
+    "mean_tpot_ms": 5.409259642841263,
+    "throughput_rps": 42.96444086097844,
+    "slo_attainment": 1.0,
+    "slo_pass": true,
+    "memory_bytes": null,
+    "communication_ns": null,
+    "compute_ns": null
+  },
+  "uncertainty": {
+    "seed_count": 1,
+    "method": "none_single_burst_run",
+    "ci95_halfwidth": null,
+    "interval_low": null,
+    "interval_high": null
+  },
+  "ranking": {
+    "rank": 0,
+    "total_candidates_ranked": 1,
+    "indistinguishable_from_winner": false,
+    "winner_equivalence_group_size": 1
+  },
+  "search": {
+    "regime": "burst",
+    "method": "single_stage",
+    "search_space_size": 1,
+    "candidates_evaluated": 1,
+    "shortlist_size": null
+  },
+  "provenance": {
+    "timestamp_utc": "2026-08-26T16:44:07.655902+00:00",
+    "planner_git_sha": "unknown-sandbox",
+    "simulator_git_sha": null,
+    "topology_id": "5a79a8b3bd4d8f1e",
+    "seed": 0
+  }
+}

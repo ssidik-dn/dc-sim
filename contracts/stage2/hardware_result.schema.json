@@ -1,0 +1,419 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://dc-sim.internal/contracts/stage2/hardware_result.schema.json",
+  "title": "HardwareResult",
+  "description": "What `sim_real` produced by actually executing a     `DeploymentManifest`. Every field here is something `sim_real` can     itself observe -- no simulator-internal component (compute/comm     breakdowns, contention-model bottleneck attribution) is required,     since a real launcher has no way to produce one (this task's own     S10 instruction).",
+  "x-schema-version": "1.0",
+  "x-version-policy": "Major-version mismatch between a payload's own top-level *_version field and this schema's x-schema-version is a hard reject (see tools/stage2/serialization.check_major_version) -- there is no migration path, by design.",
+  "type": "object",
+  "properties": {
+    "hardware_result_version": {
+      "type": "string"
+    },
+    "manifest_id": {
+      "type": "string"
+    },
+    "candidate_id": {
+      "type": "string"
+    },
+    "execution_status": {
+      "type": "string"
+    },
+    "observed_placement": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PlacementRankAssignment"
+      }
+    },
+    "workload_realization": {
+      "$ref": "#/$defs/WorkloadRealization"
+    },
+    "occupancy_evidence": {
+      "$ref": "#/$defs/OccupancyEvidence"
+    },
+    "system": {
+      "$ref": "#/$defs/SystemInfo"
+    },
+    "observed_runtime_identity": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RuntimeSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "observed_model_identity": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "metrics": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HardwareMetrics"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "memory": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemoryObservation"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "raw_result_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "provenance": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Provenance"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "hardware_result_version",
+    "manifest_id",
+    "candidate_id",
+    "execution_status",
+    "observed_placement",
+    "workload_realization",
+    "occupancy_evidence",
+    "system"
+  ],
+  "$defs": {
+    "PlacementRankAssignment": {
+      "type": "object",
+      "properties": {
+        "logical_group": {
+          "type": "string"
+        },
+        "replica": {
+          "type": "integer"
+        },
+        "parallel_rank": {
+          "type": "integer"
+        },
+        "host": {
+          "type": "string"
+        },
+        "physical_gpu": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "logical_group",
+        "replica",
+        "parallel_rank",
+        "host",
+        "physical_gpu"
+      ],
+      "description": "One logical rank's own physical location -- the leaf of     `logical group -> replica -> parallel rank -> host -> physical GPU`     this task's own S3 asks for. `host` is a *real* host identifier     (e.g. `\"xai-3\"`), not the planner's own abstract machine index --     see `PlacementSpec.topology_machine_to_host` for why that binding is     a separate, explicit field rather than folded in here silently."
+    },
+    "WorkloadRealization": {
+      "type": "object",
+      "properties": {
+        "requested_regime": {
+          "type": "string"
+        },
+        "requested_request_count": {
+          "type": "integer"
+        },
+        "achieved_request_count": {
+          "type": "integer"
+        },
+        "requested_qps": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "achieved_qps": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "scheduling_lag_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "requested_regime",
+        "requested_request_count",
+        "achieved_request_count"
+      ],
+      "description": "WorkloadRealization(requested_regime: 'str', requested_request_count: 'int', achieved_request_count: 'int', requested_qps: 'Optional[float]' = None, achieved_qps: 'Optional[float]' = None, scheduling_lag_ms: 'Optional[float]' = None)"
+    },
+    "OccupancyEvidence": {
+      "type": "object",
+      "properties": {
+        "contention_status": {
+          "type": "string"
+        },
+        "pre_run_occupancy": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {},
+            "description": "object keyed by string"
+          }
+        },
+        "post_run_occupancy": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {},
+            "description": "object keyed by string"
+          }
+        },
+        "in_run_conflicting_process_evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exclusive_run": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "contention_evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "contention_status"
+      ],
+      "description": "S11: occupancy/contention is first-class, not an afterthought on     `HardwareResult`. `contention_status` is the field     `DecisionValidation` reads to decide whether this result may ever     become `HardwareBest` (see `decision.py`)."
+    },
+    "SystemInfo": {
+      "type": "object",
+      "properties": {
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "gpu_identities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "runtime_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "image_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "hosts"
+      ],
+      "description": "SystemInfo(hosts: 'Tuple[str, ...]', gpu_identities: 'Tuple[str, ...]' = <factory>, runtime_version: 'Optional[str]' = None, image_digest: 'Optional[str]' = None)"
+    },
+    "RuntimeSpec": {
+      "type": "object",
+      "properties": {
+        "engine": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "engine_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "precision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quantization": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transport": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "decode_ffn_scheduler": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "description": "Engine/runtime facts a real launch needs that a simulation never     did -- every field optional, since a manifest destined only for     further simulation (not real hardware) may not have any of them yet."
+    },
+    "HardwareMetrics": {
+      "type": "object",
+      "properties": {
+        "ttft": {
+          "$ref": "#/$defs/LatencyStats"
+        },
+        "tpot": {
+          "$ref": "#/$defs/LatencyStats"
+        },
+        "e2e": {
+          "$ref": "#/$defs/LatencyStats"
+        },
+        "request_throughput_rps": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "token_throughput_tps": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "slo_attainment": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "ttft",
+        "tpot",
+        "e2e"
+      ],
+      "description": "HardwareMetrics(ttft: 'LatencyStats', tpot: 'LatencyStats', e2e: 'LatencyStats', request_throughput_rps: 'Optional[float]' = None, token_throughput_tps: 'Optional[float]' = None, slo_attainment: 'Optional[float]' = None)"
+    },
+    "LatencyStats": {
+      "type": "object",
+      "properties": {
+        "mean": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "median": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "p95": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "description": "LatencyStats(mean: 'Optional[float]' = None, median: 'Optional[float]' = None, p95: 'Optional[float]' = None)"
+    },
+    "MemoryObservation": {
+      "type": "object",
+      "properties": {
+        "per_host_bytes": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "description": "object keyed by string"
+        },
+        "per_gpu_bytes": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "description": "object keyed by string"
+        },
+        "peak_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "description": "MemoryObservation(per_host_bytes: 'Dict[str, int]' = <factory>, per_gpu_bytes: 'Dict[str, int]' = <factory>, peak_bytes: 'Optional[int]' = None)"
+    },
+    "Provenance": {
+      "type": "object",
+      "properties": {
+        "timestamp_utc": {
+          "type": "string"
+        },
+        "planner_git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "simulator_git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "topology_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seed": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "timestamp_utc"
+      ],
+      "description": "General, non-profile provenance -- present on every one of the     four top-level objects (this task's own S20: \"no unlocated headline     numbers\")."
+    }
+  }
+}

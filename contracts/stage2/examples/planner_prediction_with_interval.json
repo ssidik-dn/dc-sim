@@ -1,0 +1,43 @@
+{
+  "planner_prediction_version": "1.0",
+  "plan_id": "stage2-example-tie-and-interval",
+  "selected_manifest_id": "stage2-example-tie-and-interval",
+  "candidate_id": "tp2_shape2_ep1_epshape1_ar1_fr1",
+  "predicted": {
+    "objective_value": 2.916858802769933,
+    "mean_tpot_ms": 2.916858802769933,
+    "throughput_rps": 3.668922138112712,
+    "slo_attainment": 1.0,
+    "slo_pass": true,
+    "memory_bytes": null,
+    "communication_ns": null,
+    "compute_ns": null
+  },
+  "uncertainty": {
+    "seed_count": 3,
+    "method": "student_t_95_on_seeded_mean",
+    "ci95_halfwidth": 0.35194303996540605,
+    "interval_low": 2.564915762804527,
+    "interval_high": 3.268801842735339
+  },
+  "ranking": {
+    "rank": 0,
+    "total_candidates_ranked": 2,
+    "indistinguishable_from_winner": false,
+    "winner_equivalence_group_size": 1
+  },
+  "search": {
+    "regime": "streaming",
+    "method": "single_stage",
+    "search_space_size": 2,
+    "candidates_evaluated": 2,
+    "shortlist_size": null
+  },
+  "provenance": {
+    "timestamp_utc": "2026-08-26T16:52:02.092808+00:00",
+    "planner_git_sha": "unknown-sandbox",
+    "simulator_git_sha": null,
+    "topology_id": "5a79a8b3bd4d8f1e",
+    "seed": null
+  }
+}

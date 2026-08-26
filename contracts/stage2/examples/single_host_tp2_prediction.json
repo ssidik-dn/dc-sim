@@ -1,0 +1,43 @@
+{
+  "planner_prediction_version": "1.0",
+  "plan_id": "stage2-example-single_host_tp2",
+  "selected_manifest_id": "stage2-example-single_host_tp2",
+  "candidate_id": "tp2_shape2_ep1_epshape1_ar1_fr1",
+  "predicted": {
+    "objective_value": 4.69308617894929,
+    "mean_tpot_ms": 4.69308617894929,
+    "throughput_rps": 48.80777381014086,
+    "slo_attainment": 1.0,
+    "slo_pass": true,
+    "memory_bytes": null,
+    "communication_ns": null,
+    "compute_ns": null
+  },
+  "uncertainty": {
+    "seed_count": 1,
+    "method": "none_single_burst_run",
+    "ci95_halfwidth": null,
+    "interval_low": null,
+    "interval_high": null
+  },
+  "ranking": {
+    "rank": 0,
+    "total_candidates_ranked": 1,
+    "indistinguishable_from_winner": false,
+    "winner_equivalence_group_size": 1
+  },
+  "search": {
+    "regime": "burst",
+    "method": "single_stage",
+    "search_space_size": 1,
+    "candidates_evaluated": 1,
+    "shortlist_size": null
+  },
+  "provenance": {
+    "timestamp_utc": "2026-08-26T16:43:49.242259+00:00",
+    "planner_git_sha": "unknown-sandbox",
+    "simulator_git_sha": null,
+    "topology_id": "5a79a8b3bd4d8f1e",
+    "seed": 0
+  }
+}

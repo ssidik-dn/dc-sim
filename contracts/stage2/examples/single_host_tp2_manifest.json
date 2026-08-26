@@ -1,0 +1,164 @@
+{
+  "manifest_version": "1.0",
+  "plan_id": "stage2-example-single_host_tp2",
+  "candidate_id": "tp2_shape2_ep1_epshape1_ar1_fr1",
+  "input_identity": {
+    "topology": {
+      "name": "domain64",
+      "num_machines": 2,
+      "gpus_per_machine": 64,
+      "scale_up_GBps": 400.0,
+      "scale_out_GBps": 50.0,
+      "topology_id": "5a79a8b3bd4d8f1e"
+    },
+    "hardware": {
+      "device": "h800",
+      "memory_margin_fraction": 0.2
+    },
+    "model": {
+      "model_name": "Phi-tiny-MoE-instruct",
+      "total_experts": 16,
+      "router_topk": 2,
+      "is_moe": true,
+      "hidden_size": 4096,
+      "num_attention_heads": 16,
+      "num_key_value_heads": 4,
+      "num_layers": 32,
+      "head_dim": 128,
+      "kv_factor": null,
+      "runtime_num_kv_heads": null,
+      "runtime_head_dim": null
+    },
+    "workload": {
+      "regime": "burst",
+      "num_requests": 8,
+      "prefill_tokens": 128,
+      "decode_tokens": 32,
+      "qps": null,
+      "seed": null,
+      "num_seeds": null,
+      "workload_identity": null
+    },
+    "constraints": {
+      "slo_tpot_ms": 1000.0,
+      "slo_attainment_floor": 0.0,
+      "throughput_floor": {
+        "mode": "absolute",
+        "value": 0.0,
+        "baseline_candidate_id": null
+      },
+      "memory_margin_fraction": 0.2,
+      "availability_assumptions": null
+    },
+    "objective": {
+      "minimize": "mean_tpot_ms",
+      "direction": "minimize"
+    }
+  },
+  "parallelism": {
+    "attn_tp": 2,
+    "attn_shape": [
+      2
+    ],
+    "ffn_ep": 1,
+    "ep_shape": [
+      1
+    ],
+    "relative": null,
+    "attn_replicas": 1,
+    "ffn_replicas": 1
+  },
+  "placement": {
+    "assignments": [
+      {
+        "logical_group": "DECODE_ATTN",
+        "replica": 0,
+        "parallel_rank": 0,
+        "host": "hostA",
+        "physical_gpu": 1
+      },
+      {
+        "logical_group": "DECODE_ATTN",
+        "replica": 0,
+        "parallel_rank": 1,
+        "host": "hostA",
+        "physical_gpu": 2
+      },
+      {
+        "logical_group": "DECODE_FFN",
+        "replica": 0,
+        "parallel_rank": 0,
+        "host": "hostA",
+        "physical_gpu": 3
+      },
+      {
+        "logical_group": "PREFILL",
+        "replica": 0,
+        "parallel_rank": 0,
+        "host": "hostA",
+        "physical_gpu": 0
+      }
+    ],
+    "topology_machine_to_host": {
+      "0": "hostA"
+    }
+  },
+  "runtime": {
+    "engine": "frontier-sim",
+    "engine_version": null,
+    "model_revision": null,
+    "precision": null,
+    "quantization": null,
+    "transport": null
+  },
+  "workload": {
+    "regime": "burst",
+    "num_requests": 8,
+    "prefill_tokens": 128,
+    "decode_tokens": 32,
+    "qps": null,
+    "seed": null,
+    "num_seeds": null,
+    "workload_identity": null
+  },
+  "constraints": {
+    "slo_tpot_ms": 1000.0,
+    "slo_attainment_floor": 0.0,
+    "throughput_floor": {
+      "mode": "absolute",
+      "value": 0.0,
+      "baseline_candidate_id": null
+    },
+    "memory_margin_fraction": 0.2,
+    "availability_assumptions": null
+  },
+  "profile_provenance": {
+    "profile_files": [
+      "data/profiling/compute/h800/Phi-tiny-MoE-instruct/attention.csv",
+      "data/profiling/compute/h800/Phi-tiny-MoE-instruct/linear_op.csv",
+      "data/profiling/compute/h800/Phi-tiny-MoE-instruct/moe.csv"
+    ],
+    "device": "h800",
+    "model": "Phi-tiny-MoE-instruct",
+    "operator_families_covered": [
+      "attention",
+      "linear_op",
+      "moe"
+    ],
+    "collection_commit": null,
+    "profile_generation_version": null,
+    "phase_filter_applied": null,
+    "block_table_fix_applied": null,
+    "grid_bounds": null,
+    "known_limitations": [
+      "flat-extrapolation gap outside profiled tp grid (task 52) not closed here"
+    ]
+  },
+  "provenance": {
+    "timestamp_utc": "2026-08-26T16:43:49.242164+00:00",
+    "planner_git_sha": "unknown-sandbox",
+    "simulator_git_sha": null,
+    "topology_id": "5a79a8b3bd4d8f1e",
+    "seed": 0
+  }
+}

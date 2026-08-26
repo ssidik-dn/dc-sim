@@ -1,0 +1,229 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://dc-sim.internal/contracts/stage2/planner_prediction.schema.json",
+  "title": "PlannerPrediction",
+  "description": "What the planner predicted for the selected candidate, with the     uncertainty and ranking context `tools/planner_core.py` already     computes -- never stripped down to a single number before crossing     the file boundary.",
+  "x-schema-version": "1.0",
+  "x-version-policy": "Major-version mismatch between a payload's own top-level *_version field and this schema's x-schema-version is a hard reject (see tools/stage2/serialization.check_major_version) -- there is no migration path, by design.",
+  "type": "object",
+  "properties": {
+    "planner_prediction_version": {
+      "type": "string"
+    },
+    "plan_id": {
+      "type": "string"
+    },
+    "selected_manifest_id": {
+      "type": "string"
+    },
+    "candidate_id": {
+      "type": "string"
+    },
+    "predicted": {
+      "$ref": "#/$defs/PredictedMetrics"
+    },
+    "uncertainty": {
+      "$ref": "#/$defs/UncertaintySpec"
+    },
+    "ranking": {
+      "$ref": "#/$defs/RankingSpec"
+    },
+    "search": {
+      "$ref": "#/$defs/SearchSpec"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    }
+  },
+  "required": [
+    "planner_prediction_version",
+    "plan_id",
+    "selected_manifest_id",
+    "candidate_id",
+    "predicted",
+    "uncertainty",
+    "ranking",
+    "search",
+    "provenance"
+  ],
+  "$defs": {
+    "PredictedMetrics": {
+      "type": "object",
+      "properties": {
+        "objective_value": {
+          "type": "number"
+        },
+        "mean_tpot_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "throughput_rps": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "slo_attainment": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "slo_pass": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "memory_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "communication_ns": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "compute_ns": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "objective_value"
+      ],
+      "description": "Mirrors the fields `SimulationEvaluator.evaluate`'s own result     dict actually returns (`tools/planner.py`) -- `memory_bytes`/     `communication_ns`/`compute_ns` are `Optional` because the real     per-candidate result dict does not carry a memory/communication/     compute breakdown today (checked directly, not assumed): memory     feasibility is checked once, up front, by `feasible_num_blocks`,     separately from the priced result, and no component ledger is     attached to `evaluate()`'s own return value. `\"if available\"`     (this task's own S8) is honoured literally -- these three fields     are `None` for every real prediction this project's search     currently produces, and the exporter does not fabricate a value to     fill them."
+    },
+    "UncertaintySpec": {
+      "type": "object",
+      "properties": {
+        "seed_count": {
+          "type": "integer"
+        },
+        "method": {
+          "type": "string"
+        },
+        "ci95_halfwidth": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "interval_low": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "interval_high": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "seed_count",
+        "method"
+      ],
+      "description": "Carries exactly what `Regime`/`compute_interval_stats` already     compute (task 45) -- never invents a confidence figure for a     `Regime(num_seeds=1)` burst prediction, where `ci95_halfwidth` is     genuinely `None` in the source data, not merely unreported."
+    },
+    "RankingSpec": {
+      "type": "object",
+      "properties": {
+        "rank": {
+          "type": "integer"
+        },
+        "total_candidates_ranked": {
+          "type": "integer"
+        },
+        "indistinguishable_from_winner": {
+          "type": "boolean"
+        },
+        "winner_equivalence_group_size": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "rank",
+        "total_candidates_ranked",
+        "indistinguishable_from_winner",
+        "winner_equivalence_group_size"
+      ],
+      "description": "`rank` is the position in `plan()`'s own sorted-by-objective     list -- an ordering the search really does compute. What it must     not be read as is a claim of statistical distinguishability at     every adjacent pair; `indistinguishable_from_winner` is the one     tie-relevant fact `plan()` itself computes (task 45's own     `_mark_indistinguishable_from_winner`), and it is *winner-relative*     only. This project's own search does not currently compute a full     pairwise tie/equivalence partition across every candidate (e.g.     \"is rank 5 indistinguishable from rank 6, neither being the     winner\") -- `winner_equivalence_group_size` is a direct count of     how many ranked rows share `indistinguishable_from_winner=True`     (including the winner itself), not an invented broader grouping.     This is the honest boundary this task's own S8 (\"Do NOT serialize a     fake total ordering\") is read against: the ordering is real: the     tie information is exactly as complete as `plan()` itself makes it,     named precisely rather than padded out."
+    },
+    "SearchSpec": {
+      "type": "object",
+      "properties": {
+        "regime": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "search_space_size": {
+          "type": "integer"
+        },
+        "candidates_evaluated": {
+          "type": "integer"
+        },
+        "shortlist_size": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "regime",
+        "method",
+        "search_space_size",
+        "candidates_evaluated"
+      ],
+      "description": "What kind of search produced this prediction, and how big the     space was -- `method` is `\"single_stage\"` (`plan()`) or     `\"two_stage\"` (`plan_two_stage()`, task 45 Part B); `shortlist_size`     is `None` for a single-stage result, since there is no shortlist     step to size."
+    },
+    "Provenance": {
+      "type": "object",
+      "properties": {
+        "timestamp_utc": {
+          "type": "string"
+        },
+        "planner_git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "simulator_git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "topology_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seed": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "timestamp_utc"
+      ],
+      "description": "General, non-profile provenance -- present on every one of the     four top-level objects (this task's own S20: \"no unlocated headline     numbers\")."
+    }
+  }
+}

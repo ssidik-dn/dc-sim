@@ -1,0 +1,150 @@
+{
+  "decision_validation_version": "1.0",
+  "plan_id": "stage2-example-attn_a_ffn_b",
+  "planner_selected_candidate": "tp4_shape4_ep2_epshape2_reldisjoint_ar1_fr1",
+  "hardware_best_candidate": "tp4_shape4_ep2_epshape2_reldisjoint_ar1_fr1",
+  "top1_correct": true,
+  "topk_correct": true,
+  "k": 2,
+  "regret_absolute": 0.0,
+  "regret_relative": 0.0,
+  "planner_margin": -0.21074035715873674,
+  "hardware_margin": 0.0,
+  "tie_handling": "planner's own winner-equivalence group had 1 member(s) (indistinguishable_from_winner=False); top-k correctness above also credits a hardware winner that matches any id in equivalence_group_hardware_ids, not only an exact top-1 match",
+  "resolvability": {
+    "resolvable": false,
+    "reason": "regret (0.0000) is smaller than the measured noise floor (0.3000) at this configuration -- hardware cannot distinguish the planner's choice from the true optimum",
+    "noise_floor_source": {
+      "hardware_config_id": "SYNTHETIC-ILLUSTRATIVE-NOT-REAL-HARDWARE",
+      "workload_id": "SYNTHETIC-ILLUSTRATIVE-NOT-REAL-HARDWARE",
+      "regime": "burst",
+      "repeats": 10,
+      "measured_cv_pct": 3.5,
+      "measured_ci95_halfwidth": 0.3,
+      "date": "2026-08-26",
+      "runtime_version": "SYNTHETIC-ILLUSTRATIVE-NOT-REAL-HARDWARE"
+    }
+  },
+  "slo": {
+    "planner_predicted_pass": true,
+    "hardware_observed_pass": true
+  },
+  "throughput": {
+    "planner_predicted": 42.96444086097844,
+    "hardware_observed": 41.8,
+    "floor": 0.0,
+    "floor_pass": true
+  },
+  "placement": {
+    "requested": [
+      {
+        "logical_group": "DECODE_ATTN",
+        "replica": 0,
+        "parallel_rank": 0,
+        "host": "hostA",
+        "physical_gpu": 1
+      },
+      {
+        "logical_group": "DECODE_ATTN",
+        "replica": 0,
+        "parallel_rank": 1,
+        "host": "hostA",
+        "physical_gpu": 2
+      },
+      {
+        "logical_group": "DECODE_ATTN",
+        "replica": 0,
+        "parallel_rank": 2,
+        "host": "hostA",
+        "physical_gpu": 3
+      },
+      {
+        "logical_group": "DECODE_ATTN",
+        "replica": 0,
+        "parallel_rank": 3,
+        "host": "hostA",
+        "physical_gpu": 4
+      },
+      {
+        "logical_group": "DECODE_FFN",
+        "replica": 0,
+        "parallel_rank": 0,
+        "host": "hostB",
+        "physical_gpu": 0
+      },
+      {
+        "logical_group": "DECODE_FFN",
+        "replica": 0,
+        "parallel_rank": 1,
+        "host": "hostB",
+        "physical_gpu": 1
+      },
+      {
+        "logical_group": "PREFILL",
+        "replica": 0,
+        "parallel_rank": 0,
+        "host": "hostA",
+        "physical_gpu": 0
+      }
+    ],
+    "observed": [
+      {
+        "logical_group": "DECODE_ATTN",
+        "replica": 0,
+        "parallel_rank": 0,
+        "host": "hostA",
+        "physical_gpu": 1
+      },
+      {
+        "logical_group": "DECODE_ATTN",
+        "replica": 0,
+        "parallel_rank": 1,
+        "host": "hostA",
+        "physical_gpu": 2
+      },
+      {
+        "logical_group": "DECODE_ATTN",
+        "replica": 0,
+        "parallel_rank": 2,
+        "host": "hostA",
+        "physical_gpu": 3
+      },
+      {
+        "logical_group": "DECODE_ATTN",
+        "replica": 0,
+        "parallel_rank": 3,
+        "host": "hostA",
+        "physical_gpu": 4
+      },
+      {
+        "logical_group": "DECODE_FFN",
+        "replica": 0,
+        "parallel_rank": 0,
+        "host": "hostB",
+        "physical_gpu": 0
+      },
+      {
+        "logical_group": "DECODE_FFN",
+        "replica": 0,
+        "parallel_rank": 1,
+        "host": "hostB",
+        "physical_gpu": 1
+      },
+      {
+        "logical_group": "PREFILL",
+        "replica": 0,
+        "parallel_rank": 0,
+        "host": "hostA",
+        "physical_gpu": 0
+      }
+    ],
+    "exact_match": true
+  },
+  "provenance": {
+    "timestamp_utc": "2026-08-26T16:52:54.619648+00:00",
+    "planner_git_sha": null,
+    "simulator_git_sha": null,
+    "topology_id": null,
+    "seed": null
+  }
+}

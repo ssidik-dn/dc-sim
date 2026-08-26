@@ -1,0 +1,129 @@
+{
+  "hardware_result_version": "1.0",
+  "manifest_id": "stage2-example-attn_a_ffn_b",
+  "candidate_id": "tp4_shape4_ep2_epshape2_reldisjoint_ar1_fr1",
+  "execution_status": "RUNTIME_CLEAN_SUCCESS",
+  "observed_placement": [
+    {
+      "logical_group": "DECODE_ATTN",
+      "replica": 0,
+      "parallel_rank": 0,
+      "host": "hostA",
+      "physical_gpu": 1
+    },
+    {
+      "logical_group": "DECODE_ATTN",
+      "replica": 0,
+      "parallel_rank": 1,
+      "host": "hostA",
+      "physical_gpu": 2
+    },
+    {
+      "logical_group": "DECODE_ATTN",
+      "replica": 0,
+      "parallel_rank": 2,
+      "host": "hostA",
+      "physical_gpu": 3
+    },
+    {
+      "logical_group": "DECODE_ATTN",
+      "replica": 0,
+      "parallel_rank": 3,
+      "host": "hostA",
+      "physical_gpu": 4
+    },
+    {
+      "logical_group": "DECODE_FFN",
+      "replica": 0,
+      "parallel_rank": 0,
+      "host": "hostB",
+      "physical_gpu": 0
+    },
+    {
+      "logical_group": "DECODE_FFN",
+      "replica": 0,
+      "parallel_rank": 1,
+      "host": "hostB",
+      "physical_gpu": 1
+    },
+    {
+      "logical_group": "PREFILL",
+      "replica": 0,
+      "parallel_rank": 0,
+      "host": "hostA",
+      "physical_gpu": 0
+    }
+  ],
+  "workload_realization": {
+    "requested_regime": "burst",
+    "requested_request_count": 8,
+    "achieved_request_count": 8,
+    "requested_qps": null,
+    "achieved_qps": null,
+    "scheduling_lag_ms": null
+  },
+  "occupancy_evidence": {
+    "contention_status": "clean",
+    "pre_run_occupancy": [],
+    "post_run_occupancy": [],
+    "in_run_conflicting_process_evidence": [],
+    "exclusive_run": true,
+    "contention_evidence": []
+  },
+  "system": {
+    "hosts": [
+      "hostA",
+      "hostB"
+    ],
+    "gpu_identities": [],
+    "runtime_version": "SYNTHETIC-ILLUSTRATIVE-NOT-REAL-HARDWARE",
+    "image_digest": null
+  },
+  "observed_runtime_identity": {
+    "engine": "vllm",
+    "engine_version": null,
+    "model_revision": null,
+    "precision": null,
+    "quantization": null,
+    "transport": "tcp"
+  },
+  "observed_model_identity": "Phi-tiny-MoE-instruct",
+  "metrics": {
+    "ttft": {
+      "mean": 1.1,
+      "median": null,
+      "p95": null
+    },
+    "tpot": {
+      "mean": 5.62,
+      "median": 5.55,
+      "p95": 6.4
+    },
+    "e2e": {
+      "mean": 6.7,
+      "median": null,
+      "p95": null
+    },
+    "request_throughput_rps": 41.8,
+    "token_throughput_tps": null,
+    "slo_attainment": 1.0
+  },
+  "memory": {
+    "per_host_bytes": {
+      "hostA": 45097156608,
+      "hostB": 19327352832
+    },
+    "per_gpu_bytes": {},
+    "peak_bytes": null
+  },
+  "raw_result_paths": [
+    "SYNTHETIC-ILLUSTRATIVE-NOT-REAL-HARDWARE/no-file-exists"
+  ],
+  "provenance": {
+    "timestamp_utc": "2026-08-26T00:00:00+00:00",
+    "planner_git_sha": null,
+    "simulator_git_sha": null,
+    "topology_id": null,
+    "seed": null
+  }
+}

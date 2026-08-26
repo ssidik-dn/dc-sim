@@ -1,0 +1,332 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://dc-sim.internal/contracts/stage2/decision_validation.schema.json",
+  "title": "DecisionValidation",
+  "description": "Whether the planner's selected candidate matches what real     hardware benchmarking would have chosen -- Task 54's own reframing     of the whole product question, made concrete and comparable.",
+  "x-schema-version": "1.0",
+  "x-version-policy": "Major-version mismatch between a payload's own top-level *_version field and this schema's x-schema-version is a hard reject (see tools/stage2/serialization.check_major_version) -- there is no migration path, by design.",
+  "type": "object",
+  "properties": {
+    "decision_validation_version": {
+      "type": "string"
+    },
+    "plan_id": {
+      "type": "string"
+    },
+    "planner_selected_candidate": {
+      "type": "string"
+    },
+    "hardware_best_candidate": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "top1_correct": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "topk_correct": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "k": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "regret_absolute": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "regret_relative": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "planner_margin": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "hardware_margin": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "tie_handling": {
+      "type": "string"
+    },
+    "resolvability": {
+      "$ref": "#/$defs/ResolvabilitySpec"
+    },
+    "slo": {
+      "$ref": "#/$defs/SloComparison"
+    },
+    "throughput": {
+      "$ref": "#/$defs/ThroughputComparison"
+    },
+    "placement": {
+      "$ref": "#/$defs/PlacementComparison"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    }
+  },
+  "required": [
+    "decision_validation_version",
+    "plan_id",
+    "planner_selected_candidate",
+    "hardware_best_candidate",
+    "top1_correct",
+    "topk_correct",
+    "k",
+    "regret_absolute",
+    "regret_relative",
+    "planner_margin",
+    "hardware_margin",
+    "tie_handling",
+    "resolvability",
+    "slo",
+    "throughput",
+    "placement",
+    "provenance"
+  ],
+  "$defs": {
+    "ResolvabilitySpec": {
+      "type": "object",
+      "properties": {
+        "resolvable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "noise_floor_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NoiseFloorSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "resolvable",
+        "reason"
+      ],
+      "description": "`resolvable=None` (unknown) whenever no configuration-specific     noise source exists -- never silently substituted with an old     global figure (task 55's own \"do not inherit a noise floor\" -- this     task's own S13 restates it for this exact object)."
+    },
+    "NoiseFloorSource": {
+      "type": "object",
+      "properties": {
+        "hardware_config_id": {
+          "type": "string"
+        },
+        "workload_id": {
+          "type": "string"
+        },
+        "regime": {
+          "type": "string"
+        },
+        "repeats": {
+          "type": "integer"
+        },
+        "measured_cv_pct": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "measured_ci95_halfwidth": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "date": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runtime_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "hardware_config_id",
+        "workload_id",
+        "regime",
+        "repeats"
+      ],
+      "description": "S13: the noise floor is per-configuration, never inherited.     Every `DecisionValidation` that claims `resolvable=True` must point     at one of these, naming exactly which configuration, workload,     regime, and repeat count it was measured from."
+    },
+    "SloComparison": {
+      "type": "object",
+      "properties": {
+        "planner_predicted_pass": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "hardware_observed_pass": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "planner_predicted_pass",
+        "hardware_observed_pass"
+      ],
+      "description": "SloComparison(planner_predicted_pass: 'Optional[bool]', hardware_observed_pass: 'Optional[bool]')"
+    },
+    "ThroughputComparison": {
+      "type": "object",
+      "properties": {
+        "planner_predicted": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "hardware_observed": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "floor": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "floor_pass": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "planner_predicted",
+        "hardware_observed",
+        "floor",
+        "floor_pass"
+      ],
+      "description": "ThroughputComparison(planner_predicted: 'Optional[float]', hardware_observed: 'Optional[float]', floor: 'Optional[float]', floor_pass: 'Optional[bool]')"
+    },
+    "PlacementComparison": {
+      "type": "object",
+      "properties": {
+        "requested": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PlacementRankAssignment"
+          }
+        },
+        "observed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PlacementRankAssignment"
+          }
+        },
+        "exact_match": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "requested",
+        "observed",
+        "exact_match"
+      ],
+      "description": "PlacementComparison(requested: 'Tuple[PlacementRankAssignment, ...]', observed: 'Tuple[PlacementRankAssignment, ...]', exact_match: 'bool')"
+    },
+    "PlacementRankAssignment": {
+      "type": "object",
+      "properties": {
+        "logical_group": {
+          "type": "string"
+        },
+        "replica": {
+          "type": "integer"
+        },
+        "parallel_rank": {
+          "type": "integer"
+        },
+        "host": {
+          "type": "string"
+        },
+        "physical_gpu": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "logical_group",
+        "replica",
+        "parallel_rank",
+        "host",
+        "physical_gpu"
+      ],
+      "description": "One logical rank's own physical location -- the leaf of     `logical group -> replica -> parallel rank -> host -> physical GPU`     this task's own S3 asks for. `host` is a *real* host identifier     (e.g. `\"xai-3\"`), not the planner's own abstract machine index --     see `PlacementSpec.topology_machine_to_host` for why that binding is     a separate, explicit field rather than folded in here silently."
+    },
+    "Provenance": {
+      "type": "object",
+      "properties": {
+        "timestamp_utc": {
+          "type": "string"
+        },
+        "planner_git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "simulator_git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "topology_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seed": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "timestamp_utc"
+      ],
+      "description": "General, non-profile provenance -- present on every one of the     four top-level objects (this task's own S20: \"no unlocated headline     numbers\")."
+    }
+  }
+}

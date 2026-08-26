@@ -1,0 +1,566 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://dc-sim.internal/contracts/stage2/deployment_manifest.schema.json",
+  "title": "DeploymentManifest",
+  "description": "What to run, exactly, and nothing the runtime needs to interpret.     Every field here has a stated owner (the planner/exporter) and a     stated consumer (`sim_real`, reading only this file) -- no     decorative fields (this task's own S3 instruction), checked by     `docs/stage-2-gate-a-contract-report.md`'s own field-by-field table.",
+  "x-schema-version": "1.0",
+  "x-version-policy": "Major-version mismatch between a payload's own top-level *_version field and this schema's x-schema-version is a hard reject (see tools/stage2/serialization.check_major_version) -- there is no migration path, by design.",
+  "type": "object",
+  "properties": {
+    "manifest_version": {
+      "type": "string"
+    },
+    "plan_id": {
+      "type": "string"
+    },
+    "candidate_id": {
+      "type": "string"
+    },
+    "input_identity": {
+      "$ref": "#/$defs/InputIdentity"
+    },
+    "parallelism": {
+      "$ref": "#/$defs/ParallelismSpec"
+    },
+    "placement": {
+      "$ref": "#/$defs/PlacementSpec"
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeSpec"
+    },
+    "workload": {
+      "$ref": "#/$defs/WorkloadSpecRef"
+    },
+    "constraints": {
+      "$ref": "#/$defs/ConstraintSpec"
+    },
+    "profile_provenance": {
+      "$ref": "#/$defs/ProfileProvenance"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    }
+  },
+  "required": [
+    "manifest_version",
+    "plan_id",
+    "candidate_id",
+    "input_identity",
+    "parallelism",
+    "placement",
+    "runtime",
+    "workload",
+    "constraints",
+    "profile_provenance",
+    "provenance"
+  ],
+  "$defs": {
+    "InputIdentity": {
+      "type": "object",
+      "properties": {
+        "topology": {
+          "$ref": "#/$defs/TopologySpecRef"
+        },
+        "hardware": {
+          "$ref": "#/$defs/HardwareSpecRef"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelSpecRef"
+        },
+        "workload": {
+          "$ref": "#/$defs/WorkloadSpecRef"
+        },
+        "constraints": {
+          "$ref": "#/$defs/ConstraintSpec"
+        },
+        "objective": {
+          "$ref": "#/$defs/ObjectiveSpec"
+        }
+      },
+      "required": [
+        "topology",
+        "hardware",
+        "model",
+        "workload",
+        "constraints",
+        "objective"
+      ],
+      "description": "The six explicit inputs this task's own S1 requires -- no ambient     fabric, model, workload, or regime. Every `DeploymentManifest`     carries its own copy; two manifests can be compared for \"was this     actually the same question\" without any side-channel assumption."
+    },
+    "TopologySpecRef": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "num_machines": {
+          "type": "integer"
+        },
+        "gpus_per_machine": {
+          "type": "integer"
+        },
+        "scale_up_GBps": {
+          "type": "number"
+        },
+        "scale_out_GBps": {
+          "type": "number"
+        },
+        "topology_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "num_machines",
+        "gpus_per_machine",
+        "scale_up_GBps",
+        "scale_out_GBps",
+        "topology_id"
+      ],
+      "description": "A JSON-safe identity for a `planner_core.Topology` -- enough to     tell whether two manifests were planned against the same fabric,     not a serialization of the fabric graph itself (which `contracts/`     has no business reconstructing; `sim_real` does not need the graph,     only where each rank goes -- see `PlacementSpec`)."
+    },
+    "HardwareSpecRef": {
+      "type": "object",
+      "properties": {
+        "device": {
+          "type": "string"
+        },
+        "memory_margin_fraction": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "device",
+        "memory_margin_fraction"
+      ],
+      "description": "Mirrors `planner_core.Hardware` exactly (device, memory margin) --     already flat and JSON-safe; wrapped here only so `input_identity`     has one uniform shape across all six spec kinds."
+    },
+    "ModelSpecRef": {
+      "type": "object",
+      "properties": {
+        "model_name": {
+          "type": "string"
+        },
+        "total_experts": {
+          "type": "integer"
+        },
+        "router_topk": {
+          "type": "integer"
+        },
+        "is_moe": {
+          "type": "boolean"
+        },
+        "hidden_size": {
+          "type": "integer"
+        },
+        "num_attention_heads": {
+          "type": "integer"
+        },
+        "num_key_value_heads": {
+          "type": "integer"
+        },
+        "num_layers": {
+          "type": "integer"
+        },
+        "head_dim": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "kv_factor": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "runtime_num_kv_heads": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "runtime_head_dim": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "model_name",
+        "total_experts",
+        "router_topk",
+        "is_moe",
+        "hidden_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "num_layers"
+      ],
+      "description": "Mirrors `planner_core.ModelSpec`'s own fields that determine a     model's identity and memory/compute behaviour. Deliberately excludes     `admissible_tp`/`admissible_ep`/`profiled_tp` -- those are properties     of *what the search is allowed to try*, not of the model itself, and     belong in `SearchSpec` (`PlannerPrediction`), not here."
+    },
+    "WorkloadSpecRef": {
+      "type": "object",
+      "properties": {
+        "regime": {
+          "type": "string"
+        },
+        "num_requests": {
+          "type": "integer"
+        },
+        "prefill_tokens": {
+          "type": "integer"
+        },
+        "decode_tokens": {
+          "type": "integer"
+        },
+        "qps": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "seed": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "num_seeds": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "workload_identity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "regime",
+        "num_requests",
+        "prefill_tokens",
+        "decode_tokens"
+      ],
+      "description": "`regime` has no default (S6) -- constructing this without one is     a `TypeError` from the dataclass itself, and `validators.py` checks     it again explicitly so a JSON payload missing it is also rejected,     not just a Python call site."
+    },
+    "ConstraintSpec": {
+      "type": "object",
+      "properties": {
+        "slo_tpot_ms": {
+          "type": "number"
+        },
+        "slo_attainment_floor": {
+          "type": "number"
+        },
+        "throughput_floor": {
+          "$ref": "#/$defs/ThroughputFloor"
+        },
+        "memory_margin_fraction": {
+          "type": "number"
+        },
+        "availability_assumptions": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "slo_tpot_ms",
+        "slo_attainment_floor",
+        "throughput_floor",
+        "memory_margin_fraction"
+      ],
+      "description": "The constraint half of `planner_core.Objectives` -- SLO,     throughput floor, and memory margin -- split out from the objective     half (`ObjectiveSpec`) because S7 asks for them as separate concerns,     even though `Objectives` itself bundles them into one dataclass     (unchanged; this is a contract-layer decomposition, not a planner     change)."
+    },
+    "ThroughputFloor": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string"
+        },
+        "value": {
+          "type": "number"
+        },
+        "baseline_candidate_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "mode",
+        "value"
+      ],
+      "description": "S7: the floor must support absolute and relative-to-baseline     modes, because a fixed absolute floor invalidated every candidate     when the workload changed. **`mode=\"relative_to_baseline\"` is     representable here but not yet backed by `tools/planner_core.py`'s     own search** -- `Objectives.min_throughput_rps` (the only throughput     constraint the real search implements today) is absolute only. This     is a real gap, reported in the S19 report rather than closed here,     per this task's own \"report the mismatch rather than silently     changing it.\""
+    },
+    "ObjectiveSpec": {
+      "type": "object",
+      "properties": {
+        "minimize": {
+          "type": "string"
+        },
+        "direction": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "minimize"
+      ],
+      "description": "The objective half of `planner_core.Objectives`. `minimize` names     the field `plan()` sorts `evaluated` rows by (today, always     `\"mean_tpot_ms\"` -- checked in exporters.py against the live     `Objectives.minimize` value, not assumed)."
+    },
+    "ParallelismSpec": {
+      "type": "object",
+      "properties": {
+        "attn_tp": {
+          "type": "integer"
+        },
+        "attn_shape": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "ffn_ep": {
+          "type": "integer"
+        },
+        "ep_shape": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "relative": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attn_replicas": {
+          "type": "integer"
+        },
+        "ffn_replicas": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "attn_tp",
+        "attn_shape",
+        "ffn_ep",
+        "ep_shape",
+        "relative",
+        "attn_replicas",
+        "ffn_replicas"
+      ],
+      "description": "Mirrors `planner_core.Candidate`'s own parallelism fields exactly,     including `relative` (task 57) -- the field that distinguishes     \"attention whole on one domain, experts whole on another\" from     colocation. Carrying `relative` here, not just `attn_shape`/`ep_shape`,     is what keeps this spec able to express what task 56 found the old,     two-component key could not (see `exporters.py`'s own round-trip     test and this task's own S4/S11.B)."
+    },
+    "PlacementSpec": {
+      "type": "object",
+      "properties": {
+        "assignments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PlacementRankAssignment"
+          }
+        },
+        "topology_machine_to_host": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "object keyed by stringified int"
+        }
+      },
+      "required": [
+        "assignments",
+        "topology_machine_to_host"
+      ],
+      "description": "The explicit rank-to-GPU map this manifest commits to, plus the     binding that produced it. `topology_machine_to_host` is carried     separately from the assignments themselves because the planner's own     `Topology`/`Fabric` only knows abstract machine indices (`GpuId.machine`,     an integer) -- it has no notion of a real fleet hostname at all,     and cannot supply one. Something *outside* the planner (whoever     calls the exporter for a specific real run) must supply this binding     explicitly; leaving it implicit would be exactly the \"ambient     context\" this task's own S1 forbids."
+    },
+    "PlacementRankAssignment": {
+      "type": "object",
+      "properties": {
+        "logical_group": {
+          "type": "string"
+        },
+        "replica": {
+          "type": "integer"
+        },
+        "parallel_rank": {
+          "type": "integer"
+        },
+        "host": {
+          "type": "string"
+        },
+        "physical_gpu": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "logical_group",
+        "replica",
+        "parallel_rank",
+        "host",
+        "physical_gpu"
+      ],
+      "description": "One logical rank's own physical location -- the leaf of     `logical group -> replica -> parallel rank -> host -> physical GPU`     this task's own S3 asks for. `host` is a *real* host identifier     (e.g. `\"xai-3\"`), not the planner's own abstract machine index --     see `PlacementSpec.topology_machine_to_host` for why that binding is     a separate, explicit field rather than folded in here silently."
+    },
+    "RuntimeSpec": {
+      "type": "object",
+      "properties": {
+        "engine": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "engine_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "precision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quantization": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transport": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "decode_ffn_scheduler": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "description": "Engine/runtime facts a real launch needs that a simulation never     did -- every field optional, since a manifest destined only for     further simulation (not real hardware) may not have any of them yet."
+    },
+    "ProfileProvenance": {
+      "type": "object",
+      "properties": {
+        "profile_files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "device": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "operator_families_covered": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "collection_commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profile_generation_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phase_filter_applied": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "block_table_fix_applied": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "grid_bounds": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {},
+          "description": "object keyed by string"
+        },
+        "known_limitations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "profile_files",
+        "device",
+        "model",
+        "operator_families_covered"
+      ],
+      "description": "File-level profile provenance -- \"profile version\" alone cannot     tell two planner results apart when the actual defect was at file     granularity (task 52's phase contamination, task 53's block-table     aliasing and the still-open flat-extrapolation gap). Every boolean     flag here is `Optional[bool]`: `True`/`False` only when this     manifest's own exporter could actually confirm which code path ran     (task 53's own patches are opt-in, source-hash-guarded, and off by     default -- `tools/stage2/exporters.py` reads whether they were     actually installed for this run, not assumed)."
+    },
+    "Provenance": {
+      "type": "object",
+      "properties": {
+        "timestamp_utc": {
+          "type": "string"
+        },
+        "planner_git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "simulator_git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "topology_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seed": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "timestamp_utc"
+      ],
+      "description": "General, non-profile provenance -- present on every one of the     four top-level objects (this task's own S20: \"no unlocated headline     numbers\")."
+    }
+  }
+}
