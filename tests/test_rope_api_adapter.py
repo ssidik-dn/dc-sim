@@ -31,11 +31,38 @@ def _reset_module_state():
     rope_api_adapter._observed_vllm_version = None
 
 
+def _restore_patched_frontier_rotary_module():
+    """`install_rope_api_adapter()` mutates
+    `frontier.profiling.common.layers.rotary_embedding._load_vllm_get_rope`
+    (a real, process-global, cross-test attribute on Frontier's own
+    module) -- resetting only this module's own `_installed` flag
+    leaves that mutation in place for every later test in the same
+    process, real, live-caught: `install_rope_api_adapter()`'s own
+    hash guard hashes *whatever function object is currently bound* to
+    `_load_vllm_get_rope`, which after one test's own successful
+    install is this module's own wrapper closure, not Frontier's real
+    original -- a later test's own install call then sees a "changed"
+    hash and fails for a reason having nothing to do with its own
+    behavior. Restores Frontier's real original from a fresh
+    `importlib.reload`, and only if that module has ever actually been
+    imported (skipped entirely, correctly, in this sandbox where
+    `torch` -- and therefore this module -- is never importable at
+    all)."""
+    if "frontier.profiling.common.layers.rotary_embedding" not in sys.modules:
+        return
+    import importlib
+
+    import frontier.profiling.common.layers.rotary_embedding as rope_module
+
+    importlib.reload(rope_module)
+
+
 @pytest.fixture(autouse=True)
 def _isolate():
     _reset_module_state()
     yield
     _reset_module_state()
+    _restore_patched_frontier_rotary_module()
 
 
 # --------------------------------------------------------------- A: old API
