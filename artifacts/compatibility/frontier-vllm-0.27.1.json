@@ -43,7 +43,18 @@
       },
       "anomaly": "runtime warning '[WARNING] num_tokens=1: Missing operations: [\"add\"]' -- no time_stats.add.* column exists in either CSV schema (confirmed identical header both probes), so this did not remove any expected column from the saved row; recorded, not silently dropped"
     },
-    "664_row_sweep": "NOT RUN -- explicitly out of scope for this task"
+    "664_row_sweep": "SUPERSEDED -- see full_sweep below",
+    "full_sweep": {
+      "status": "COMPLETE",
+      "report": "docs/tasks/65-stage2-gate-c1-full-sweep-completion-report.md",
+      "total_rows": 834,
+      "row_count_note": "664 originally estimated; +170 rows from two real, tool-driven, additive mechanisms (linear_op TP=2/4 sharded+replicated row split; attention prefill's own default-range+chunked-point generation) discovered during this task -- not a grid redesign, nothing originally required was dropped",
+      "sentinel": "PASS 4/4 (linear_op TP=2, linear_op TP=4, attention prefill, attention decode)",
+      "coverage_check": "PASS -- zero missing (tp, effective_tokens) keys across tp in {1,2,4}, verified against the real combined data",
+      "host": "xai-3", "gpu_index": 4,
+      "collection_timestamp": "2026-08-27T12:10-12:15Z",
+      "storage_location": "xai-3:~/rocm-work/gate-c1-smoke/sweep_output/ (not yet installed into Frontier's data/profiling/ tree)"
+    }
   },
   "entries": [
     {
