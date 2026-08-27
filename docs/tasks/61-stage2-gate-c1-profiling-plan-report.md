@@ -684,18 +684,49 @@ its own task instruction).
 **Pre-execution coverage test added**: `tools/stage2/gate_c1_coverage.py`
 (`derive_prefill_effective_tokens`, `derive_decode_effective_tokens`,
 `derive_linear_op_required_points`, `missing_keys`, `unused_keys`,
-`read_profiled_num_tokens`, `verify_gate_c_linear_op_coverage`) derives
-every key above from `Workload`/the real scheduler constant, not a
-hidden list — `tests/test_gate_c1_coverage.py` (14 tests) proves the
-old grid fails this check (`test_original_grid_has_real_missing_and_unused_keys`,
+`read_profiled_effective_tokens_by_tp`, `verify_gate_c_linear_op_coverage`)
+derives every key above from `Workload`/the real scheduler constant,
+not a hidden list — `tests/test_gate_c1_coverage.py` (16 tests) proves
+the old grid fails this check (`test_original_grid_has_real_missing_and_unused_keys`,
 `test_verify_gate_c_linear_op_coverage_flags_the_real_gap`) and the
 corrected grid passes it
-(`test_verify_gate_c_linear_op_coverage_passes_once_corrected`), plus
-one test reading a real `mi355x` CSV's own `num_tokens` column to prove
-the reader parses a real file, not only a synthetic fixture. No
+(`test_verify_gate_c_linear_op_coverage_passes_once_corrected`). No
 performance measurement is faked anywhere in this module — it only
 derives required keys and compares them against whatever a real,
 already-collected CSV's own column actually contains.
+
+**Rehearsed end-to-end against a real CSV before approving the smoke
+test** (`meta-llama/Llama-2-7b-hf`'s own real, unmodified
+`linear_op.csv` on `mi355x` — a different, larger dense model, its own
+coverage is not claimed sufficient for Qwen3-0.6B, only used to
+rehearse the parser/coverage path): this surfaced one real bug, fixed
+before any GPU time is spent. The original `read_profiled_num_tokens`
+read the whole `num_tokens` column flat, ignoring
+`num_tensor_parallel_workers` — safe only by coincidence against this
+one file (its own real sweep happens to use an identical `num_tokens`
+list at every profiled `tp`), but wrong in general, and wrong for
+*this plan's own* proposed collection specifically (§16 Stage 3
+deliberately profiles a strictly larger key set at `tp=1` than at
+`tp=2`/`tp=4` — a flat reader would have unioned those together once
+collected, reporting `tp=2`/`tp=4` as covering keys they were never
+actually profiled at). Replaced with `read_profiled_effective_tokens_by_tp`,
+which groups by the real `num_tensor_parallel_workers` column. Rehearsal
+result: the real file parsed cleanly under its own real column names
+and dtypes (`num_tokens`, `num_tensor_parallel_workers` — confirmed
+present, plain integer-valued strings); observed real coverage was
+259 distinct `num_tokens` values at each of `tp∈{1,2,4,8}` (min 1, max
+4096); `verify_gate_c_linear_op_coverage` ran end-to-end without
+crashing and correctly reported real, substantial gaps against Gate
+C's own derived requirement — 47/58 keys missing at `tp=1`, 25/32
+missing at `tp=2` and at `tp=4` (e.g. `3,5,6,7,9,...` — real,
+reachable Gate C keys Llama's own grid never happened to hit), plus
+248–252 unused profiled keys per `tp` (Llama's own coarse
+power-of-two-ish spacing above 32). No false "covered" result — exactly
+the expected outcome for an unrelated model's profile, and proof the
+checker fails loudly rather than silently passing. Both the fix and
+this rehearsal are captured as tests
+(`test_read_profiled_effective_tokens_by_tp_does_not_conflate_asymmetric_tp_coverage`,
+`test_gate_c1_coverage_rehearsal_against_the_real_llama_mi355x_csv`).
 `verify_gate_c_linear_op_coverage` must be run for real against
 Qwen3-0.6B's own real CSVs once they exist, before any
 `SimulationEvaluator` call is trusted for Gate C — the planner still

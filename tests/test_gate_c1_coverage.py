@@ -4,12 +4,14 @@
 
 No GPU, no real profile CSV required for most of this file -- the
 derivation itself is pure math over `Workload`/scheduler constants.
-`test_verify_gate_c_linear_op_coverage_reads_a_real_csv` is the one
-exception: it reads the real, already-collected `Llama-2-7b-hf`
-`linear_op.csv` on `mi355x` (present in this checkout) purely to prove
-`read_profiled_num_tokens` parses a real file's real column, not a
-synthetic fixture -- it is not asserting Llama coverage is sufficient
-for anything.
+The tests named `..._on_the_real_llama_mi355x_csv` are the exception:
+they read the real, already-collected, unmodified
+`meta-llama/Llama-2-7b-hf` `linear_op.csv` on `mi355x` (present in this
+checkout) purely to rehearse the parser/coverage path against a real
+file's real schema -- **Llama-2-7b-hf is a different, larger dense
+model; its own real coverage is never claimed sufficient for
+Qwen3-0.6B or Gate C**, only used to prove the helper parses real
+column names/dtypes and reports real per-`tp` gaps correctly.
 """
 from __future__ import annotations
 
@@ -28,9 +30,15 @@ from stage2.gate_c1_coverage import (  # noqa: E402
     derive_linear_op_required_points,
     derive_prefill_effective_tokens,
     missing_keys,
-    read_profiled_num_tokens,
+    read_profiled_effective_tokens_by_tp,
     unused_keys,
     verify_gate_c_linear_op_coverage,
+)
+
+REAL_LLAMA_MI355X_LINEAR_OP_CSV = (
+    Path(__file__).resolve().parent.parent.parent
+    / "Frontier" / "data" / "profiling" / "compute" / "mi355x"
+    / "meta-llama" / "Llama-2-7b-hf" / "linear_op.csv"
 )
 
 # Gate C's own real, frozen workload (docs/stage-2-gate-c-planner-handoff-report.md):
@@ -142,33 +150,44 @@ def test_verify_gate_c_linear_op_coverage_raises_if_a_tp_has_no_recorded_data_at
         )
 
 
-def test_read_profiled_num_tokens_parses_a_synthetic_csv():
+def test_read_profiled_effective_tokens_by_tp_parses_a_synthetic_csv():
     with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["num_tokens", "other_col"])
+        writer = csv.DictWriter(
+            fh, fieldnames=["num_tokens", "num_tensor_parallel_workers", "other_col"]
+        )
         writer.writeheader()
-        for n in (1, 2, 4, 8):
-            writer.writerow({"num_tokens": n, "other_col": "x"})
+        for tp, tokens in [(1, 1), (1, 2), (1, 58), (2, 1), (2, 2)]:
+            writer.writerow(
+                {"num_tokens": tokens, "num_tensor_parallel_workers": tp, "other_col": "x"}
+            )
         path = fh.name
     try:
-        assert read_profiled_num_tokens(path) == frozenset({1, 2, 4, 8})
+        by_tp = read_profiled_effective_tokens_by_tp(path)
+        assert by_tp == {1: frozenset({1, 2, 58}), 2: frozenset({1, 2})}
     finally:
         Path(path).unlink()
 
 
-def test_read_profiled_num_tokens_parses_a_real_mi355x_csv():
-    real_csv = (
-        Path(__file__).resolve().parent.parent.parent
-        / "Frontier" / "data" / "profiling" / "compute" / "mi355x"
-        / "meta-llama" / "Llama-2-7b-hf" / "linear_op.csv"
-    )
-    if not real_csv.exists():
-        pytest.skip("real mi355x Llama-2-7b-hf linear_op.csv not present in this checkout")
-    values = read_profiled_num_tokens(str(real_csv))
-    assert len(values) > 0
-    assert all(isinstance(v, int) for v in values)
+def test_read_profiled_effective_tokens_by_tp_does_not_conflate_asymmetric_tp_coverage():
+    """The exact real gap a flat, tp-blind reader would hide: tp=1 has a
+    real key (58) that tp=2 was never actually profiled at -- proving
+    grouping by `num_tensor_parallel_workers` matters, not merely that
+    parsing succeeds."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["num_tokens", "num_tensor_parallel_workers"])
+        writer.writeheader()
+        writer.writerow({"num_tokens": 58, "num_tensor_parallel_workers": 1})
+        writer.writerow({"num_tokens": 3, "num_tensor_parallel_workers": 2})
+        path = fh.name
+    try:
+        by_tp = read_profiled_effective_tokens_by_tp(path)
+        assert 58 not in by_tp[2]
+        assert 3 not in by_tp[1]
+    finally:
+        Path(path).unlink()
 
 
-def test_read_profiled_num_tokens_rejects_a_missing_column():
+def test_read_profiled_effective_tokens_by_tp_rejects_a_missing_column():
     with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=["some_other_column"])
         writer.writeheader()
@@ -176,6 +195,43 @@ def test_read_profiled_num_tokens_rejects_a_missing_column():
         path = fh.name
     try:
         with pytest.raises(ValueError):
-            read_profiled_num_tokens(path)
+            read_profiled_effective_tokens_by_tp(path)
     finally:
         Path(path).unlink()
+
+
+def _skip_if_real_llama_csv_absent():
+    if not REAL_LLAMA_MI355X_LINEAR_OP_CSV.exists():
+        pytest.skip("real mi355x Llama-2-7b-hf linear_op.csv not present in this checkout")
+
+
+def test_read_profiled_effective_tokens_by_tp_parses_the_real_llama_mi355x_csv():
+    _skip_if_real_llama_csv_absent()
+    by_tp = read_profiled_effective_tokens_by_tp(str(REAL_LLAMA_MI355X_LINEAR_OP_CSV))
+    assert set(by_tp.keys()) == {1, 2, 4, 8}  # this file's own real, profiled tp sweep
+    for tp, values in by_tp.items():
+        assert len(values) > 0
+        assert all(isinstance(v, int) for v in values)
+
+
+def test_gate_c1_coverage_rehearsal_against_the_real_llama_mi355x_csv():
+    """Parser/coverage-path rehearsal only -- Llama-2-7b-hf is not
+    Qwen3-0.6B and this test does not claim its coverage suffices for
+    Gate C. It proves: the real file parses under the real column
+    names/dtypes, `verify_gate_c_linear_op_coverage` runs end-to-end
+    against real per-`tp` data without crashing, and it correctly
+    reports real, substantial missing keys (Llama's own real grid was
+    built for a different model/workload and does not happen to cover
+    Gate C's synthetic requirement) with no false "covered" result."""
+    _skip_if_real_llama_csv_absent()
+    profiled_by_tp = read_profiled_effective_tokens_by_tp(str(REAL_LLAMA_MI355X_LINEAR_OP_CSV))
+    result = verify_gate_c_linear_op_coverage(
+        GATE_C_WORKLOAD, GATE_C_ATTN_TP_VALUES, MAX_TOKENS_IN_BATCH, profiled_by_tp
+    )
+    assert set(result.keys()) == {1, 2, 4}
+    for tp in (1, 2, 4):
+        assert len(result[tp]) > 0  # a real, substantial gap -- not falsely "covered"
+    # A specific, checkable real gap: Llama's own real tp=1 grid has 1,2,4,8,16,24,32
+    # but not every contiguous integer in between.
+    assert 3 in result[1]
+    assert 7 in result[1]

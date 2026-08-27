@@ -134,18 +134,44 @@ def unused_keys(required: FrozenSet[int], profiled: FrozenSet[int]) -> FrozenSet
     return frozenset(profiled - required)
 
 
-def read_profiled_num_tokens(csv_path: str, column: str = "num_tokens") -> FrozenSet[int]:
-    """Read the real, already-collected `linear_op.csv`'s own `num_tokens`
-    column values -- the actual profiled key set, from the real file, not
-    from whatever grid was intended."""
-    values: Set[int] = set()
+def read_profiled_effective_tokens_by_tp(
+    csv_path: str,
+    tokens_column: str = "num_tokens",
+    tp_column: str = "num_tensor_parallel_workers",
+) -> Dict[int, FrozenSet[int]]:
+    """Read a real, already-collected `linear_op.csv`'s own per-`tp`
+    `effective_tokens` coverage -- grouped by its own real
+    `num_tensor_parallel_workers` column, not flattened across every row.
+
+    Rehearsed directly against the real `mi355x`/`meta-llama/Llama-2-7b-hf`
+    `linear_op.csv` in this checkout (a different, larger dense model --
+    this is a parser rehearsal only, its own real per-`tp` token set does
+    not cover Qwen3-0.6B/Gate C and is never claimed to): that file
+    happens to sweep an identical `num_tokens` list at every profiled
+    `tp` (`1,2,4,8`), which would have hidden a flattening bug -- a
+    single shared set, ignoring `tp` entirely, would have looked correct
+    against that one file by coincidence. This project's own Gate C.1
+    plan (`docs/tasks/61-...md` §16 Stage 3) proposes exactly the
+    opposite: three separate invocations, a strictly larger `tp=1` key
+    set (58) than `tp=2`/`tp=4` (32 each) -- an earlier version of this
+    function (`read_profiled_num_tokens`, flat, no `tp` grouping) would
+    have silently unioned those together once collected, reporting
+    `tp=2`/`tp=4` as covering 58 keys they never actually have rows for.
+    Replaced before any real GPU profiling, not after.
+    """
+    by_tp: Dict[int, Set[int]] = {}
     with open(csv_path, newline="") as fh:
         reader = csv.DictReader(fh)
-        if column not in (reader.fieldnames or []):
-            raise ValueError(f"{csv_path!r} has no column {column!r}")
+        fieldnames = reader.fieldnames or []
+        if tokens_column not in fieldnames:
+            raise ValueError(f"{csv_path!r} has no column {tokens_column!r}")
+        if tp_column not in fieldnames:
+            raise ValueError(f"{csv_path!r} has no column {tp_column!r}")
         for row in reader:
-            values.add(int(float(row[column])))
-    return frozenset(values)
+            tp = int(float(row[tp_column]))
+            tokens = int(float(row[tokens_column]))
+            by_tp.setdefault(tp, set()).add(tokens)
+    return {tp: frozenset(values) for tp, values in by_tp.items()}
 
 
 def verify_gate_c_linear_op_coverage(
