@@ -1,9 +1,17 @@
 # Stage 2 — Gate C.1: vLLM `CustomOp`/`set_current_vllm_config` compatibility investigation
 
-**STOP after this report. No GPU was touched.** All investigation and
-validation ran CPU-only, `--network none`, no `--device` flags, on the
-real pinned image (`vllm/vllm-openai-rocm@sha256:bb44b39a...`, `xai-3`).
-Probe 1 was not run. The 664-row sweep was not started.
+**STOP after this report (original version). No GPU was touched.** All
+investigation and validation ran CPU-only, `--network none`, no
+`--device` flags, on the real pinned image
+(`vllm/vllm-openai-rocm@sha256:bb44b39a...`, `xai-3`). Probe 1 was not
+run at that point. The 664-row sweep was not started.
+
+**Addendum — real Probe 1 retry (§10 below): a real MI355X GPU attempt
+approved and executed after this report. Result: FAILED, a real,
+third, distinct compatibility break found (`RMSNorm`) — further than
+ever before (past `get_rope()`/`CustomOp`/`dispatch_forward` cleanly,
+into the real forward pass), but still no measurement row. Probe 2 was
+correctly not run. The 664-row sweep is still not started.**
 
 ---
 
@@ -417,3 +425,111 @@ reasons to redesign anything — they are the concrete pre-run checklist
 items this investigation surfaced.
 
 **STOP here, per this task's own instruction. No GPU was touched.**
+
+---
+
+## 10. Addendum: real Probe 1 GPU retry (approved after §1–§9 above)
+
+Kernel policy adopted per explicit approval:
+**`optimization_level=OptimizationLevel.O0`** (resolves to
+`custom_ops` containing `"all"`) — recorded, not defaulted silently,
+as **an isolated-uncompiled-kernel approximation, not an exact
+reproduction of production's compiled execution** (§4's own disclosed
+tension; this is the choice that side of it landed on).
+
+### 10.1 Pre-flight integration-fix status (before touching the GPU)
+
+Fresh occupancy (`xai-3`, `2026-08-27T11:20:42Z`): `4/8` free, indices
+`4,5,6,7`. Selected GPU `4`. Status check run first, no profiling,
+`--device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=4 -e CUDA_VISIBLE_DEVICES=4`:
+
+| fix | status |
+|---|---|
+| QK-norm allowlist | `applied`; allowlist = `['qwen3', 'qwen3_moe', 'qwen3_next']` |
+| RoPE API adapter | `applied=True` (lazy — `detected_api_kind` stays `None` until first real `get_rope()` call, confirmed expected, not a bug) |
+| VllmConfig profiling context | module loaded; `applied=False` before entry (correct — only set once the `with` block is entered) |
+| Task 53 block-table Fix B | `applied`; **applicability note recorded verbatim**: `linear_op` profiling never constructs `AttentionWrapper` — this fix targets a different profiling tool (`frontier/profiling/attention/`) and is not exercised by Probe 1/2, installed for completeness/future-readiness only |
+| GPU/env | `HIP_VISIBLE_DEVICES=4`, `CUDA_VISIBLE_DEVICES=4`, `torch.cuda.is_available()=True`, **`torch.cuda.device_count()==1`** — confirmed |
+
+One real warning surfaced here, worth recording: `Using
+CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed
+in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.` — both were
+set per this task's own explicit instruction; `HIP_VISIBLE_DEVICES` is
+the one that actually matters on this pinned version's own ROCm path.
+
+### 10.2 Probe 1 (`cuda_event`)
+
+- **Command**: `docker run --rm --name gate-c1-probe1-20260827T112149Z --network none --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=4 -e CUDA_VISIBLE_DEVICES=4 -v /home/ssidik/rocm-work/gate-c1-smoke:/workspace -w /workspace --entrypoint python3 vllm/vllm-openai-rocm@sha256:bb44b39aea26798cce43030a98bf48efd0322ca7147367db86e38b96bd80f0e7 /workspace/run_probe3.py cuda_event`
+- **Runtime identity**: pinned digest above, `xai-3`/`amd-mi355x-3`, GPU index `4`, pinned vLLM `0.27.1` (detected live).
+- **Live `VllmConfig` actually used**: `{'device_config.device_type': 'cuda', 'compilation_config.custom_ops': ['+sparse_attn_indexer', 'all'], 'compilation_config.mode': 'NONE', 'optimization_level': 'O0'}` — `mode=NONE` and `custom_ops` containing `'all'` confirm the approved O0 policy actually took effect, not merely requested.
+- **Wall-clock**: ~3 seconds to the failure (`START 11:21:49Z` / `END 11:22:01Z`, most of which is process/import startup).
+- **Result: FAILED. No CSV row produced** (only the same `linear_op_config.yaml` echo file as before, removed during cleanup — not a measurement).
+
+**Real progress, further than any prior attempt**: got past
+`get_rope()`/`CustomOp.__init__()`/`dispatch_forward()` cleanly (no
+error there at all this time — both prior fixes, §1–§9, hold up under
+real GPU execution, not merely the CPU-only checks). Reached the
+**real forward pass** — `LinearOpWrapper.profile()` → `self.model(...)`
+→ `GPTBlock.forward()` → `_forward_with_post_attn_norm()` →
+`self.input_layernorm(...)` — before failing with a **third, distinct,
+real** compatibility break:
+
+```
+File "frontier/profiling/common/layers/layernorm.py", line 50, in forward
+    raise ImportError(
+ImportError: vLLM is required for RMSNorm profiling. Install vllm or set PYTHONPATH to the vllm source tree.
+```
+
+**Root cause, confirmed live, not guessed**: Frontier's own `RMSNorm`
+(`frontier/profiling/common/layers/layernorm.py`) tries to import
+`rms_norm`/`fused_add_rms_norm` as free functions from
+`vllm.model_executor.layers.layernorm`. Live-checked the real pinned
+module's actual exports: `['CustomOp', 'F', 'GemmaRMSNorm', 'LayerNorm',
+'RMSNorm', 'RMSNormGated', 'envs', 'init_logger', 'ir', 'logger', 'nn',
+'poly_norm', 'rms_norm_batch_invariant', 'torch', 'vllm']` — **neither
+name exists**; the functionality now lives only on the `RMSNorm`/
+`GemmaRMSNorm` *classes'* own `forward()` methods, not as standalone
+functions. This raises loudly (an explicit `ImportError`, not a silent
+fallback) — correcting §2's own earlier, untested guess that this gap
+would "silently degrade" rather than fail hard; live execution shows
+it fails hard, which is the better of the two possible outcomes but
+still a real, unresolved blocker.
+
+**This is a new, third, distinct Frontier↔vLLM API-skew gap** (same
+family as the `rotary_dim`/`get_rope` break and the
+`set_current_vllm_config` gap, but a different symptom in a different
+module) — out of the scope explicitly authorized for this retry (which
+approved running with the *existing* three fixes, not investigating a
+new one). Per this task's own explicit instruction, **stopped here —
+Probe 2 was not run**.
+
+### 10.3 Probe 2
+
+Not attempted — Probe 1 failed; this task's own instruction is explicit
+("On any failure stop; do not run Probe 2").
+
+### 10.4 Cleanup evidence
+
+- Container: `--rm` (foreground) — `docker ps -a --filter
+  name=gate-c1-probe1` empty, confirmed gone.
+- Output artifact: `probe_output_cuda_event/` (only the config-echo
+  YAML, no measurement CSV) removed via a follow-up throwaway
+  container (root-owned inside the bind mount, same pattern as every
+  prior cleanup this initiative has needed) — confirmed gone
+  (`find` → "No such file or directory").
+- No leftover profiling process (`ps aux | grep linear_op` empty).
+- Fresh occupancy re-check immediately after: `xai-3` back to `4/8`
+  free, indices `4,5,6,7` — unchanged, GPU `4` returned to baseline.
+
+### 10.5 Remaining blocker for the next retry
+
+`frontier/profiling/common/layers/layernorm.py`'s own `RMSNorm` needs
+the same kind of investigation §1–§9 above gave `get_rope`/`CustomOp`:
+determine whether the pinned vLLM's real `RMSNorm`/`GemmaRMSNorm`
+*classes* expose an equivalent free-function-shaped call, or whether
+Frontier's own `RMSNorm.forward()` needs to construct and call the
+real class instance instead (which would itself be `CustomOp`-derived,
+confirmed earlier in §2 — meaning it would need the *same*
+`profiling_vllm_config_context()` this task already built, composing
+rather than requiring a fourth new mechanism). Not investigated or
+fixed in this task, per its own explicit scope.
