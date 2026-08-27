@@ -13,9 +13,37 @@
   },
   "profiling_kernel_policy": {
     "optimization_level": "OptimizationLevel.O0",
-    "compilation_config.custom_ops": ["all"],
+    "compilation_config.custom_ops": ["+sparse_attn_indexer", "all"],
     "compilation_config.mode": "CompilationMode.NONE",
     "disclosed_fidelity_note": "isolated-uncompiled-kernel approximation, not exact reproduction of production's compiled execution (production's own real defaults resolve to custom_ops=[\"none\"]/mode=VLLM_COMPILE, which is only representative because production also runs torch.compile fusion Frontier's profiling harness never performs for any operator)"
+  },
+  "probe_results": {
+    "probe_1_cuda_event": {
+      "status": "SUCCESS",
+      "host": "xai-3", "gpu_index": 4,
+      "wall_clock_seconds": 1.953,
+      "output_file": "compute/mi355x/Qwen3-0.6B/linear_op.csv",
+      "row_summary": {
+        "n_head": 16, "n_kv_head": 8, "n_embd": 1024, "n_expanded_embd": 3072,
+        "use_qk_norm": true, "num_tokens": 1, "num_tensor_parallel_workers": 1,
+        "measurement_type": "CUDA_EVENT", "profiling_precision": "BF16",
+        "attn_rope.mean_ms": 0.016184000065550208, "attn_rope.count": 20
+      }
+    },
+    "probe_2_record_function": {
+      "status": "SUCCESS",
+      "host": "xai-3", "gpu_index": 4,
+      "wall_clock_seconds": 2.211,
+      "output_file": "compute/mi355x/Qwen3-0.6B/linear_op_kernel_only.csv",
+      "row_summary": {
+        "n_head": 16, "n_kv_head": 8, "n_embd": 1024, "n_expanded_embd": 3072,
+        "use_qk_norm": true, "num_tokens": 1, "num_tensor_parallel_workers": 1,
+        "measurement_type": "KERNEL_ONLY", "profiling_precision": "BF16",
+        "attn_rope.mean_ms": 0.0024770000000000005, "attn_rope.count": 20
+      },
+      "anomaly": "runtime warning '[WARNING] num_tokens=1: Missing operations: [\"add\"]' -- no time_stats.add.* column exists in either CSV schema (confirmed identical header both probes), so this did not remove any expected column from the saved row; recorded, not silently dropped"
+    },
+    "664_row_sweep": "NOT RUN -- explicitly out of scope for this task"
   },
   "entries": [
     {
@@ -27,10 +55,10 @@
       "profiling_path": "linear_op (attn_rope)",
       "adapter": "rope_api_adapter.install_rope_api_adapter",
       "adapter_version": "commit 870b9c5",
-      "semantic_notes": "rotary_dim/base moved into a merged rope_parameters dict (rope_dim/rope_theta keys); adapter injects both explicitly, general for any rotary_dim value, not only rotary_dim==head_size",
+      "semantic_notes": "rotary_dim/base moved into a merged rope_parameters dict (rope_dim/rope_theta keys); adapter injects both explicitly, general for any rotary_dim value, not only rotary_dim==head_size. Live-verified on real MI355X hardware: Probe 1/2 both produced a real, finite, positive attn_rope timing (0.0162ms / 0.0025ms respectively).",
       "custom_op_requirement": true,
       "kernel_fidelity": "FUNCTIONALLY_EQUIVALENT_DIFFERENT_KERNEL",
-      "status": "RESOLVED"
+      "status": "RESOLVED_VERIFIED_LIVE"
     },
     {
       "frontier_file": "frontier/profiling/common/layers/rotary_embedding.py",
@@ -54,10 +82,10 @@
       "profiling_path": "linear_op (input_layernorm, post_attention_layernorm)",
       "adapter": "rmsnorm_api_adapter.install_rmsnorm_api_adapter",
       "adapter_version": "this task",
-      "semantic_notes": "free functions no longer exist; pinned vLLM exposes only the RMSNorm CLASS. Adapter constructs the real class (mirroring Frontier's own sibling GemmaRMSNorm wrapper, which already used this pattern and needed no fix) and delegates forward(x, residual). Numerically verified against a simple PyTorch reference within rtol/atol=1e-2.",
+      "semantic_notes": "free functions no longer exist; pinned vLLM exposes only the RMSNorm CLASS. Adapter constructs the real class (mirroring Frontier's own sibling GemmaRMSNorm wrapper, which already used this pattern and needed no fix) and delegates forward(x, residual). Numerically verified against a simple PyTorch reference within rtol/atol=1e-2. Live-observed on real MI355X hardware during Probe 1/2: even under custom_ops=[\"all\"], the real dispatch log ('Priority not set for op fused_add_rms_norm/rms_norm, using native implementation') shows the actual kernel used was the *native* PyTorch path, not a distinct hand-tuned kernel -- confirming, not merely theorizing, the disclosed fidelity tension already recorded for this op family.",
       "custom_op_requirement": true,
       "kernel_fidelity": "FUNCTIONALLY_EQUIVALENT_DIFFERENT_KERNEL",
-      "status": "RESOLVED"
+      "status": "RESOLVED_VERIFIED_LIVE"
     },
     {
       "frontier_file": "frontier/profiling/common/layers/layernorm.py",
@@ -80,10 +108,10 @@
       "qwen3_reachable": true,
       "profiling_path": "linear_op (mlp_act)",
       "adapter": null,
-      "semantic_notes": "confirmed hasattr(torch.ops._C, 'silu_and_mul') present on the pinned image at construction time (SiluAndMul.__init__'s own check did not raise in the real Probe 1 traceback's own upstream construction sequence, though the actual op has not yet been exercised on real hardware -- no forward pass has reached this op yet on GPU)",
+      "semantic_notes": "confirmed live via the real Probe 1/2 executions: time_stats.mlp_act.mean is a real, finite, positive value in both saved CSVs (e.g. 0.002363ms, count=20 in Probe 2) -- the real forward pass reached and executed this op successfully on real MI355X hardware",
       "custom_op_requirement": false,
-      "kernel_fidelity": "UNKNOWN",
-      "status": "STRUCTURALLY_COMPATIBLE_NOT_YET_EXECUTED"
+      "kernel_fidelity": "SAME",
+      "status": "COMPATIBLE_VERIFIED_LIVE"
     },
     {
       "frontier_file": "frontier/profiling/common/parallel_utils/tensor_parallel_layers.py",
@@ -199,10 +227,10 @@
       "profiling_path": "linear_op (attn_rope, input_layernorm, post_attention_layernorm)",
       "adapter": "vllm_config_context.profiling_vllm_config_context",
       "adapter_version": "commit 3c85773",
-      "semantic_notes": "one context manager covering the whole profiling construction/execution region, reused (not reimplemented) by rmsnorm_api_adapter.py; minimum config VllmConfig(device_config=DeviceConfig(device='cuda')) with optimization_level=O0 override for the approved kernel policy",
+      "semantic_notes": "one context manager covering the whole profiling construction/execution region, reused (not reimplemented) by rmsnorm_api_adapter.py; minimum config VllmConfig(device_config=DeviceConfig(device='cuda')) with optimization_level=O0 override for the approved kernel policy. Live-verified: both real probes ran to completion with this context active for the entire linear_op.main() call.",
       "custom_op_requirement": true,
       "kernel_fidelity": "APPROXIMATION",
-      "status": "RESOLVED"
+      "status": "RESOLVED_VERIFIED_LIVE"
     },
     {
       "frontier_file": "frontier/config/model_config.py",
