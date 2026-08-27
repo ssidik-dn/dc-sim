@@ -15,7 +15,11 @@ Answers below reflect that this remains unconfirmed. **Item B** —
 whether `kernel_only` measurement data is needed, addressed at §11a: it
 turns out to be required for Gate C's own first candidates under this
 project's standing `pd-af-disaggregation` convention, not optional
-future work, which corrects that ask's own framing.
+future work, which corrects that ask's own framing. A later,
+third follow-up check (§11b) verified the exact `effective_tokens` key
+space the single-feature `linear_op` operators need and found the
+originally-proposed `{1,2,4,5,8,16,32,64,128}` grid insufficient —
+corrected total real GPU measurements: **664** (was 474).
 
 ---
 
@@ -483,7 +487,7 @@ count per TP value" pattern).
 |---|---|---|---|---|
 | `attention.csv` — decode | TP × batch_size × kv_cache_size | `{1,2,4}` × `{1,2,4,6,8,12,16}` × `{0,8,16,24,32,48,64,96,128}` | 3 × 7 × 9 = **189** | §6's own decode envelope, real TP set |
 | `attention.csv` — prefill | TP × prefill total_tokens | `{1,2,4}` × `{1,2,4,5,8,16,32}` | 3 × 7 = **21** | §6's own prefill envelope, brackets the real 5-token point |
-| `linear_op.csv` (dense: `attn_pre_proj`/`attn_post_proj`/`attn_rope`/norms/`emb`/`mlp_up_proj`/`mlp_down_proj`/`mlp_act`) | TP × effective_tokens | `{1,2,4}` × a token list covering `{1,2,4,5,8,16,32,64,128}` (matches the attention-side envelope; single-feature exact-lookup operators, so the real Gate C token counts — `5` prefill, and per-request decode token positions — must literally appear in this list, not merely be bracketed) | 3 × 9 = **27** | §8.D's own "exact miss = `KeyError`" requirement |
+| `linear_op.csv` (dense: `attn_pre_proj`/`attn_post_proj`/`attn_rope`/norms/`emb`/`mlp_up_proj`/`mlp_down_proj`/`mlp_act`) | per-`tp` exact `effective_tokens` key sets, **corrected in §11b below** — the `{1,2,4,5,8,16,32,64,128}` list shown in the original draft of this row was not sufficient, verified and replaced | `tp=1`: 58 keys (`{5,10,...,160}` ∪ `{1,...,32}`); `tp=2`: 32 keys (`{1,...,32}`); `tp=4`: 32 keys (`{1,...,32}`) | 58+32+32 = **122** | §8.D's own "exact miss = `KeyError`" requirement — §11b traces *why* a sparse/bracketed grid is unsafe for this operator family specifically |
 
 Each of the three rows above must be collected **twice** — once at
 `--profile_method cuda_event` (default) and once at
@@ -503,12 +507,17 @@ trying to split the grid per-cluster and risk missing one.
 | | rows/method | × 2 methods |
 |---|---|---|
 | attention (decode+prefill) | 189 + 21 = 210 | **420** |
-| linear_op | 27 | **54** |
-| **TOTAL NEW ROWS** | | **474** |
+| linear_op (corrected, §11b) | 122 | **244** |
+| **TOTAL NEW ROWS** | | **664** |
 | **ESTIMATED REUSED ROWS** | | **0** (§5) |
-| **TOTAL REAL GPU MEASUREMENTS** | | **474** |
+| **TOTAL REAL GPU MEASUREMENTS** | | **664** |
 
-No MoE profiling (`moe.csv`) at all — `is_moe=False` (§3).
+No MoE profiling (`moe.csv`) at all — `is_moe=False` (§3). **This total
+was 474 in the version of this plan approved for the smoke-test step;
+§11b below is a follow-up verification task that found the
+`linear_op` row was under-provisioned and corrected it to 122×2=244 —
+every other row in this table (attention, kernel_only doubling, the
+`0` reused rows) was re-checked and is unchanged.**
 
 ### §11a. `kernel_only` — addendum Item B, answered as an option with a price
 
@@ -582,6 +591,117 @@ here, structurally, not by choice) — the only real decision this task
 leaves open is §16 Stage -1's own question of whether `record_function`
 mode runs on this device at all.
 
+### §11b. Exact `effective_tokens` key space — verified, not assumed (follow-up check)
+
+**The `{1,2,4,5,8,16,32,64,128}` list in §11's own `linear_op` row was
+not sufficient.** This subsection traces why, from the real code, and
+replaces it.
+
+**How `effective_tokens` is actually computed.** Traced directly:
+`Batch.get_effective_total_tokens_rounded` (`frontier/entities/batch.py`)
+delegates to `get_effective_total_tokens_for_compute` — and, despite
+the name, **no longer applies fixed multiple-of-8 rounding** ("For
+vLLM V1 eager-path parity, this helper no longer applies additional
+fixed multiple-of-8 rounding," the method's own docstring). Any
+padding it *would* apply comes from `AFDStageMetadata`'s own
+stage/DP/CUDA-Graph layers (`apply_padding`) — all three are no-ops
+for Gate C's own real config: `tools/planner.py`'s `_argv()` sets
+`af_pipeline_num_micro_batch=1` for both `decode_attn`/`decode_ffn`
+(one stage, so `compute_stage_token_lens` never splits a batch), and
+never sets a `--use_cuda_graph`-style flag (defaults `False`, so Layer
+3 padding is skipped entirely). **`effective_tokens` for Gate C is
+therefore the raw, unpadded token count of whatever the real scheduler
+put in that step's batch** — nothing rounds, pads, or reshapes it.
+
+Two, and only two, real shapes arise (`PoolKind.PREFILL`/`PoolKind.DECODE_FFN`
+are always `tp=1` in every real `Replica(...)` construction in this
+project — `tools/planner.py`/`tools/planner_core.py`, four call sites,
+confirmed by reading; only `PoolKind.DECODE_ATTN`'s own `tp` varies
+across Gate C's candidates):
+
+- **Prefill-shaped** (`PREFILL` pool, always `tp=1`): every real
+  request has exactly `prefill_tokens=5` prompt tokens (non-chunked),
+  and PD-disaggregation means `PREFILL` never processes a decode
+  token — a batch of `k` concurrently-admitted requests has
+  `effective_tokens = 5k` exactly. `k` is bounded by two real,
+  code-derived constraints: the scheduler's own token budget
+  (`--vllm_v1_scheduler_config_max_tokens_in_batch=4096`, `tools/planner.py`'s
+  own `_argv()` literal) divided by `5` (`819`), and the workload's own
+  total request count (`num_requests=32`) — concurrent admission can
+  never exceed either. `min(819, 32) = 32` is the binding one.
+- **Decode-shaped** (`DECODE_ATTN`/`DECODE_FFN` pools): each
+  concurrently-decoding request contributes exactly one token per step
+  (no speculative decoding in this workload) — `effective_tokens`
+  equals the real decode batch size directly. No scheduler-level
+  admission cap narrower than `num_requests` exists in this project's
+  own config schema (only the same token budget, which admits far more
+  than 32 decode tokens at once and is therefore never the binding
+  constraint) — so **every integer from 1 to 32 is a mathematically
+  reachable batch size**, not merely a sparse sample of it. This is the
+  central correction: sparse/bracketed sampling (safe for the
+  multi-feature attention family, which falls back to a trained
+  model) is **not** safe for an exact dictionary lookup — a real
+  decode batch of, say, 7 or 13 concurrently-decoding requests is
+  entirely plausible under real Poisson arrivals and would miss every
+  point of the originally-proposed grid.
+
+**Required Gate C keys** (`tools/stage2/gate_c1_coverage.py`,
+`derive_linear_op_required_points`, 14 hermetic tests,
+`tests/test_gate_c1_coverage.py`):
+
+| `tp` | required `effective_tokens` keys | count | why |
+|---|---|---|---|
+| 1 | `{5,10,...,160}` (prefill-shaped) ∪ `{1,...,32}` (decode-shaped) | **58** | `PREFILL`/`DECODE_FFN` always `tp=1`; `DECODE_ATTN`'s own `tp=1` candidate also needs decode-shaped keys here |
+| 2 | `{1,...,32}` (decode-shaped only) | **32** | only `DECODE_ATTN`'s `tp=2` candidates use this `tp`; `PREFILL` never runs at `tp=2` |
+| 4 | `{1,...,32}` (decode-shaped only) | **32** | only the cross-host `tp=4` candidate |
+
+**REQUIRED_KEYS**: 122 total `(tp, effective_tokens)` points (58+32+32).
+**CURRENT_KEYS** (the grid before this check): `{1,2,4,5,8,16,32,64,128}`
+applied identically at every `tp` — 9×3=27 points.
+**MISSING_KEYS**: real and substantial — at `tp=1`, every decode-shaped
+integer except `{1,2,4,5,8,16,32}` (25 values, e.g. `3,6,7,9,...,31`)
+plus every prefill-shaped multiple of 5 above 32 (26 values, `35,40,...,160`);
+at `tp=2`/`tp=4`, the same 25 missing decode-shaped integers each.
+**UNUSED_KEYS**: `{64, 128}` — neither is ever a real Gate C key at
+any `tp` (64/128 exceed the 32-request decode cap and are not
+multiples of 5), present in the old grid for no real reason.
+
+**Corrected minimal grid**: `--num_tokens_list` becomes `tp`-specific —
+`tp=1`: `1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 35 40 45 50 55 60 65 70 75 80 85 90 95 100 105 110 115 120 125 130 135 140 145 150 155 160`;
+`tp=2`/`tp=4`: `1 2 3 ... 32` (every integer, not a sample). Ugly, not a
+round or convenient list — deliberately: this task's own instruction
+was "do not add powers-of-two merely for convenience," and every key
+above traces to `Workload`/scheduler constants (§15 audit, updated),
+not a hand-picked constant.
+
+**Row-count correction**: linear_op shape-points go from 27 to
+**122** (§11's own table, updated); ×2 profile_methods (§11a) = **244**
+rows, up from 54. **Total real GPU measurements: 664**, up from 474
+(§11's own updated total; attention's own 420 rows are untouched — this
+check was scoped to the single-feature `linear_op` family only, per
+its own task instruction).
+
+**Pre-execution coverage test added**: `tools/stage2/gate_c1_coverage.py`
+(`derive_prefill_effective_tokens`, `derive_decode_effective_tokens`,
+`derive_linear_op_required_points`, `missing_keys`, `unused_keys`,
+`read_profiled_num_tokens`, `verify_gate_c_linear_op_coverage`) derives
+every key above from `Workload`/the real scheduler constant, not a
+hidden list — `tests/test_gate_c1_coverage.py` (14 tests) proves the
+old grid fails this check (`test_original_grid_has_real_missing_and_unused_keys`,
+`test_verify_gate_c_linear_op_coverage_flags_the_real_gap`) and the
+corrected grid passes it
+(`test_verify_gate_c_linear_op_coverage_passes_once_corrected`), plus
+one test reading a real `mi355x` CSV's own `num_tokens` column to prove
+the reader parses a real file, not only a synthetic fixture. No
+performance measurement is faked anywhere in this module — it only
+derives required keys and compares them against whatever a real,
+already-collected CSV's own column actually contains.
+`verify_gate_c_linear_op_coverage` must be run for real against
+Qwen3-0.6B's own real CSVs once they exist, before any
+`SimulationEvaluator` call is trusted for Gate C — the planner still
+returns `Unknown`/no `ModelSpec` exists for Qwen3-0.6B in this
+checkout today, unaffected by this check.
+
 ---
 
 ## §12. Estimated GPU time — from this project's own real evidence, not blindly applied
@@ -597,17 +717,18 @@ tracing has never been run on `mi355x`, for any model, for any
 operator**, so its own per-point overhead relative to `cuda_event` is
 unmeasured here.
 
-This plan's own grid (**474 rows**, well inside the "well-sized" scale
-Task 49's own 325-point anchor represents, not the 115,818-point
-disaster) is the right regime to apply the *fast* anchor to, with the
-slow one kept only as an explicit worst-case bound, per this task's own
-§11 instruction not to blindly apply either number:
+This plan's own grid (**664 rows** after §11b's correction, still well
+inside the "well-sized" scale Task 49's own 325-point anchor
+represents, not the 115,818-point disaster) is the right regime to
+apply the *fast* anchor to, with the slow one kept only as an explicit
+worst-case bound, per this task's own §11 instruction not to blindly
+apply either number:
 
-| | cuda_event half (~237 rows) | kernel_only half (~237 rows, unmeasured overhead) | total |
+| | cuda_event half (~332 rows) | kernel_only half (~332 rows, unmeasured overhead) | total |
 |---|---|---|---|
-| optimistic (22 pts/sec both) | ~11s | ~11s | **~25s** + startup |
-| expected (22 pts/sec cuda_event; assume 2–5× slower for unmeasured `record_function` overhead, i.e. 4–11 pts/sec) | ~11s | ~20–60s | **~1–2 minutes** + startup |
-| pessimistic (1.8 pts/sec, Task 49's own documented worst case, applied to the whole grid as the explicit safety bound) | | | **~4.4 minutes**, or, if `record_function` on this device turns out to behave like the 86.5-hour disaster case rather than merely slow, **open-ended** — this is exactly why §16's commands must run under `tmux`/`nohup` regardless of how short the estimate looks (Task 49's own "86-hour lesson," restated) |
+| optimistic (22 pts/sec both) | ~15s | ~15s | **~30s** + startup |
+| expected (22 pts/sec cuda_event; assume 2–5× slower for unmeasured `record_function` overhead, i.e. 4–11 pts/sec) | ~15s | ~30–85s | **~1–2 minutes** + startup |
+| pessimistic (1.8 pts/sec, Task 49's own documented worst case, applied to the whole grid as the explicit safety bound) | | | **~6.1 minutes**, or, if `record_function` on this device turns out to behave like the 86.5-hour disaster case rather than merely slow, **open-ended** — this is exactly why §16's commands must run under `tmux`/`nohup` regardless of how short the estimate looks (Task 49's own "86-hour lesson," restated) |
 
 **Startup overhead** (model load, Ray/worker initialization, one-time
 per `attention.main`/`linear_op.main` invocation, not per-row): not
@@ -629,10 +750,10 @@ choice this task's own §11 instruction asks to prefer.
 
 ## §13. Minimal vs. reusable profile — compared, one recommended
 
-**A. Minimal Gate-C profile** (this plan's own §11 grid): 474 rows, TP
-∈ {1,2,4}, the narrow shape envelope §6 derives, ~1–5 minutes optimistic/
-expected GPU time. Covers exactly, and only, what Gate C's four real
-candidates need.
+**A. Minimal Gate-C profile** (this plan's own §11/§11b grid): 664
+rows, TP ∈ {1,2,4}, the narrow shape envelope §6/§11b derives, ~1–5
+minutes optimistic/expected GPU time. Covers exactly, and only, what
+Gate C's four real candidates need.
 
 **B. Reusable product profile**: the same operator families, but at
 every existing model's own established broader convention — TP∈{1,2,4,8}
@@ -672,7 +793,7 @@ column has a real column in the new CSVs; `num_tensor_parallel_workers ∈
 resolved one way or the other; every provenance field in §9 that was
 `null` at plan time is now filled with a real, observed value.
 
-**B. Held-out/internal**: with 474 real rows split across ~10 operators,
+**B. Held-out/internal**: with 664 real rows split across ~10 operators,
 most individual operators will have on the order of tens of rows each —
 enough for a genuine leave-one-out check (Task 53's own
 `attn_mla_decode` example generalized well at only 8 rows once
@@ -893,25 +1014,51 @@ VALIDATION COMMANDS: §14.A's own structural checks (column presence,
   TP coverage, row counts) run against the new CSVs directly
 ```
 
-**Stage 3 — linear_op profiling** (same TP sweep, dense/non-MoE path):
+**Stage 3 — linear_op profiling** (§11b's own corrected, `tp`-specific
+`--num_tokens_list` — **not** one shared list swept across every `tp`
+in a single invocation, since `tp=1`'s own required set (58 keys) is
+strictly larger than `tp∈{2,4}`'s own (32 keys each); collecting the
+58-key list at every `tp` would cost 174 rows instead of the exact
+minimal 122, so this plan runs three separate `--num_tensor_parallel_workers`
+invocations rather than one combined sweep, per this task's own "smallest
+exact-key superset" instruction):
 
 ```
-COMMAND (cuda_event pass):
+COMMAND (tp=1, cuda_event pass):
 python3 -m frontier.profiling.linear_op.main --disable_ray --yes \
   --models Qwen3-0.6B --num_gpus 1 --device mi355x \
-  --num_tensor_parallel_workers 1 2 4 \
-  --num_tokens_list 1 2 4 5 8 16 32 64 128 \
+  --num_tensor_parallel_workers 1 \
+  --num_tokens_list 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+    21 22 23 24 25 26 27 28 29 30 31 32 35 40 45 50 55 60 65 70 75 80 \
+    85 90 95 100 105 110 115 120 125 130 135 140 145 150 155 160 \
   --profile_method cuda_event --output_dir data/profiling
   # NOTE: no --is_moe (§3/§8.D -- Qwen3-0.6B is dense; omitting the
   # flag is what produces the mlp_up_proj/mlp_down_proj/mlp_act columns)
 
-COMMAND (kernel_only pass): <same command, --profile_method record_function>
+COMMAND (tp=1, kernel_only pass): <same command, --profile_method record_function>
 
-EXPECTED ROWS: 27 × 2 = 54
-EXPECTED DURATION: a small fraction of Stage 2's own estimate (fewer
-  rows, simpler single-feature shapes) -- no independent anchor exists
-  in this project's own record for linear_op specifically (§12); treat
-  as bounded by Stage 2's own pessimistic case as a conservative ceiling
+COMMAND (tp=2, cuda_event pass):
+python3 -m frontier.profiling.linear_op.main --disable_ray --yes \
+  --models Qwen3-0.6B --num_gpus 1 --device mi355x \
+  --num_tensor_parallel_workers 2 \
+  --num_tokens_list 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+    21 22 23 24 25 26 27 28 29 30 31 32 \
+  --profile_method cuda_event --output_dir data/profiling
+
+COMMAND (tp=2, kernel_only pass): <same command, --profile_method record_function>
+
+COMMAND (tp=4, cuda_event pass): <tp=2's own command, --num_tensor_parallel_workers 4>
+COMMAND (tp=4, kernel_only pass): <same, --profile_method record_function>
+
+EXPECTED ROWS: (58 + 32 + 32) × 2 profile_methods = 122 × 2 = **244**
+  (§11b -- corrected from the original draft's 27 × 2 = 54; the
+  original `{1,2,4,5,8,16,32,64,128}` list, verified against the real
+  `effective_tokens` mechanism, left real exact-lookup keys missing)
+EXPECTED DURATION: a small fraction of Stage 2's own estimate (simpler
+  single-feature shapes, still no independent per-row anchor exists in
+  this project's own record for `linear_op` specifically, §12); treat
+  as bounded by Stage 2's own pessimistic case as a conservative ceiling,
+  scaled by 244/420 of Stage 2's own row count
 ```
 
 **Stage 4 — install and register** (no GPU): add
@@ -952,12 +1099,17 @@ Gate C shape coverage, D Frontier smoke).
    surface as a `KeyError` during Stage 5.D's smoke test if it turns
    out required and this plan's own commands don't produce it; caught
    there, not silently.
-4. **`batch_size` envelope is an estimate, not a confirmed trace**
-   (§6) — if Frontier's own real scheduler for this exact regime
-   produces a batch size outside `{1,2,4,6,8,12,16}`, §14.C's own Gate C
-   shape-coverage check would catch it as `EXTRAPOLATED`/`UNKNOWN` before
-   any planner prediction is trusted — not a silent failure, but a real
-   possibility that could require a second, small profiling pass.
+4. **`batch_size` envelope is an estimate, not a confirmed trace, for
+   the multi-feature attention side only** (§6) — if Frontier's own real
+   scheduler for this exact regime produces an attention-side batch size
+   outside `{1,2,4,6,8,12,16}`, §14.C's own Gate C shape-coverage check
+   would catch it as `EXTRAPOLATED`/`UNKNOWN` before any planner
+   prediction is trusted — not a silent failure, but a real possibility
+   that could require a second, small profiling pass. **This risk does
+   not apply to the `linear_op` single-feature side** — §11b replaced
+   precedent-based sampling there with an exact, derived key set
+   (contiguous `{1,...,32}` for decode-shaped keys), closing the
+   analogous `KeyError` risk for that operator family specifically.
 5. **Fidelity ceiling**: `TORCH_SDPA` is not confirmed equivalent to
    whatever real vLLM serving actually used (§4) — a limitation of the
    whole comparison this project can make today, not specific to this
@@ -975,8 +1127,9 @@ The **next real step is not the full sweep** — it is the two-probe
 ROCm smoke test (§16 Stage -1), one point per `--profile_method`, and
 it requires separate explicit approval before running (this task's own
 governing constraint). Once that smoke test passes for real, proceed
-with the **minimal Gate-C profile** (§13.A), on **one GPU**, **474 real
-rows**, an **estimated 1–5 minutes** of GPU time under normal
+with the **minimal Gate-C profile** (§13.A), on **one GPU**, **664 real
+rows** (corrected from 474 by §11b's own exact-`effective_tokens`
+verification), an **estimated 1–5 minutes** of GPU time under normal
 conditions (with an explicit, named pessimistic tail if
 `record_function` behaves badly), covering `attn_tp ∈ {1,2,4}` — exactly
 what Gate C's four real candidates need, no more. Three items must be
@@ -999,23 +1152,35 @@ one fix this plan does not defer.)
 `linear_op.csv`/`linear_op_kernel_only.csv`, at `attn_tp ∈ {1,2,4}`. No
 `moe.csv` is needed (dense model).
 
-**B. How many new profile rows/measurements are required?** **474**
-real GPU measurements (§11). Zero reusable rows exist anywhere in this
+**B. How many new profile rows/measurements are required?** **664**
+real GPU measurements (§11/§11b — corrected from an initial 474 once
+the exact `effective_tokens` key space was verified against the real
+scheduler code rather than assumed; 420 attention rows unchanged, 244
+linear_op rows up from 54). Zero reusable rows exist anywhere in this
 checkout (§5).
 
-**C. How long should it take on one MI355X?** Optimistic ~25 seconds;
-expected ~1–2 minutes; pessimistic several minutes to open-ended if
+**C. How long should it take on one MI355X?** Optimistic ~30 seconds;
+expected ~1–2 minutes; pessimistic ~6 minutes to open-ended if
 `record_function` misbehaves on this device for the first time ever
-(§12) — run under `tmux`/`nohup` regardless of the estimate, per this
-project's own established discipline.
+(§12, scaled for the corrected 664-row grid) — run under `tmux`/`nohup`
+regardless of the estimate, per this project's own established
+discipline.
 
 **D. Will the proposed grid put all four Gate C candidates inside
 valid profile coverage?** By derivation, yes for prefill (brackets the
 real 5-token point) and for decode `kv_cache_size` (5–36 real need
 inside a 0–128 grid). **Not independently confirmed for `batch_size`**
-(§6/§17.4) — this is the one axis this plan's own grid choice rests on
-precedent rather than a derived certainty, and §14.C's own future
-validation step is what would actually prove or disprove this answer.
+on the attention (multi-feature) side (§6/§17.4) — this is the one axis
+that grid's own choice rests on precedent rather than a derived
+certainty, and §14.C's own future validation step is what would
+actually prove or disprove this answer. **For the `linear_op`
+(single-feature, no-fallback) side specifically, this is now a "yes,"
+not "not independently confirmed"** — §11b derives the exact required
+`effective_tokens` key set from `Workload`/real scheduler constants
+rather than resting on precedent, and `tools/stage2/gate_c1_coverage.py`
+gives a real, runnable check (`verify_gate_c_linear_op_coverage`) to
+re-confirm it once real CSVs exist, rather than trusting the derivation
+alone.
 
 **E. Are the phase-filter, block-table, and QK-norm fixes active on the
 actual code path that will collect this data?** Phase filter: **not
