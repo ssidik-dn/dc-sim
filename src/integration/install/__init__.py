@@ -53,12 +53,15 @@ from ..replica_scheduler.sglang_guard import (
 from ..execution_time_predictor.mla_phase_filter import (
     install_mla_phase_filter as _install_mla_phase_filter,
 )
+from ..profiling.qk_norm_allowlist_fix import (
+    install_qk_norm_allowlist_fix as _install_qk_norm_allowlist_fix,
+)
 
 
 def install(fabric: Fabric, placement: Placement, deployment: Deployment,
            groups: CommGroupRegistry, binding: Optional[BindingConfig] = None,
            collective: bool = False, sglang_replica_scheduler: bool = False,
-           mla_phase_filter: bool = False) -> None:
+           mla_phase_filter: bool = False, qk_norm_allowlist_fix: bool = False) -> None:
     """Register every engine-backed Frontier extension, and make the engine
     state they need reachable. Safe to call more than once.
 
@@ -92,6 +95,20 @@ def install(fabric: Fabric, placement: Placement, deployment: Deployment,
     spec declares, instead of on every profiled row regardless of phase.
     `False` (the default) leaves `_train_mla_attention_layer_models`
     untouched, same as every task before this one.
+
+    `qk_norm_allowlist_fix` (Stage 2 Gate C.1) is optional and defaults to
+    `False`. `True` adds `"qwen3"` to `frontier.config.model_config.QK_NORM_MODEL_TYPE_ALLOWLIST`
+    (`..profiling.qk_norm_allowlist_fix`, guarded by an exact-contents check
+    of the allowlist) so a plain dense Qwen3 model's own real `use_qk_norm`
+    flag is correctly inferred `True` from its HF config, instead of only
+    `qwen3_moe`/`qwen3_next` -- confirmed against HuggingFace `transformers`'
+    own `Qwen3Attention` source, which applies `q_norm`/`k_norm`
+    unconditionally for every Qwen3 variant. This flag must be correct
+    *before* linear_op profiling runs, not only before evaluation --
+    `linear_op_impl.py` reads it to decide whether to actually run the
+    QK-norm compute during collection. `False` (the default) leaves
+    `QK_NORM_MODEL_TYPE_ALLOWLIST` untouched, same as every task before
+    this one.
     """
     _cc_backend.install()
     if collective:
@@ -100,5 +117,7 @@ def install(fabric: Fabric, placement: Placement, deployment: Deployment,
         _install_sglang_replica_scheduler_guard()
     if mla_phase_filter:
         _install_mla_phase_filter()
+    if qk_norm_allowlist_fix:
+        _install_qk_norm_allowlist_fix()
     _set_context(EngineContext(fabric, placement, deployment, groups, binding=binding,
                                collective=collective))
