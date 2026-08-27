@@ -1,0 +1,56 @@
+{
+  "generated_at": "2026-08-27T12:40:00Z",
+  "source_of_truth": "xai-3:~/rocm-work/gate-c1-smoke/sweep_output/ (real MI355X GPU collection, 2026-08-27T12:10-12:15Z, 834 rows, GPU index 4)",
+  "combination_step": "linear_op.csv / linear_op_kernel_only.csv combined from 3 separate real per-TP invocations (TP=1,2,4) by column-NAME (not position -- real header-order differs between TP=1 and TP=2/4 runs, confirmed and reconciled), zero rows dropped/duplicated (58+64+64=186 confirmed)",
+  "entries": [
+    {
+      "source": "/tmp/gate-c1-smoke-stage/install_staging/linear_op.csv",
+      "destination": "/work/simulation/Frontier/data/profiling/compute/mi355x/Qwen3-0.6B/linear_op.csv",
+      "sha256": "df88410556874a1eefa3247abecfe2801bc7c62476c7dc75253963278db94761",
+      "rows": 186,
+      "conflict_check": "destination directory did not exist before this install (confirmed fresh)"
+    },
+    {
+      "source": "/tmp/gate-c1-smoke-stage/install_staging/linear_op_kernel_only.csv",
+      "destination": "/work/simulation/Frontier/data/profiling/compute/mi355x/Qwen3-0.6B/linear_op_kernel_only.csv",
+      "sha256": "9cb54311f73f134c2168d509c82082b97992bd86e3dfa3aeb2fcd025419b397b",
+      "rows": 186,
+      "conflict_check": "destination directory did not exist before this install (confirmed fresh)"
+    },
+    {
+      "source": "/tmp/gate-c1-smoke-stage/install_staging/attention.csv",
+      "destination": "/work/simulation/Frontier/data/profiling/compute/mi355x/Qwen3-0.6B/attention.csv",
+      "sha256": "60dde5646984b15fa59bbdfe8f7d0bbe515d6674792e2b186ff3991afadfedfc",
+      "rows": 231,
+      "conflict_check": "destination directory did not exist before this install (confirmed fresh)"
+    },
+    {
+      "source": "/tmp/gate-c1-smoke-stage/install_staging/attention_kernel_only.csv",
+      "destination": "/work/simulation/Frontier/data/profiling/compute/mi355x/Qwen3-0.6B/attention_kernel_only.csv",
+      "sha256": "eefb7af2a68ee0146be7f1e76f7f75126d33434194aeff66d126ebc8109ac231",
+      "rows": 231,
+      "conflict_check": "destination directory did not exist before this install (confirmed fresh)"
+    },
+    {
+      "source": "/tmp/gate-c1-smoke-stage/install_staging/attention_combined.csv",
+      "destination": "/work/simulation/Frontier/data/profiling/compute/mi355x/Qwen3-0.6B/attention_combined.csv",
+      "sha256": "4aa73655a0082f1de7c8c90269e585c4fe29bd4e5c6f5a5e16bba1bbf1d5f23d",
+      "rows": 231,
+      "conflict_check": "destination directory did not exist before this install (confirmed fresh)"
+    },
+    {
+      "source": "/tmp/gate-c1-smoke-stage/install_staging/attention_combined_kernel_only.csv",
+      "destination": "/work/simulation/Frontier/data/profiling/compute/mi355x/Qwen3-0.6B/attention_combined_kernel_only.csv",
+      "sha256": "0a838b260bc80f77c403c9c5cb58490f04daec8848c521e00b678113ede6846d",
+      "rows": 231,
+      "conflict_check": "destination directory did not exist before this install (confirmed fresh)"
+    },
+    {
+      "source": "/tmp/gate-c1-smoke-stage/install_staging/Qwen3-0.6B.json",
+      "destination": "/work/simulation/Frontier/data/config/models/Qwen3-0.6B.json",
+      "sha256": "5961c24163c4561db19d7702bad0337c5259b4c37f48e8425abc4c482578b937",
+      "content": "real HF config.json fields for Qwen/Qwen3-0.6B @ c1899de289a04d12100db370d81485cdf75e47ca",
+      "conflict_check": "destination file did not exist before this install (confirmed fresh)"
+    }
+  ]
+}
