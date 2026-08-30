@@ -1,0 +1,43 @@
+{
+  "planner_prediction_version": "1.0",
+  "plan_id": "gate-c1-qwen3-0.6b-mi355x-tp-search-v1",
+  "selected_manifest_id": "gate-c1-qwen3-0.6b-mi355x-tp-search-v1",
+  "candidate_id": "tp1_shape1_ep1_epshape1_ar1_fr1",
+  "predicted": {
+    "objective_value": 4.752745140223708,
+    "mean_tpot_ms": 4.752745140223708,
+    "throughput_rps": 4.0612835596169345,
+    "slo_attainment": 1.0,
+    "slo_pass": true,
+    "memory_bytes": null,
+    "communication_ns": null,
+    "compute_ns": null
+  },
+  "uncertainty": {
+    "seed_count": 3,
+    "method": "student_t_95_on_seeded_mean",
+    "ci95_halfwidth": 0.0832151684081571,
+    "interval_low": 4.669529971815551,
+    "interval_high": 4.835960308631865
+  },
+  "ranking": {
+    "rank": 0,
+    "total_candidates_ranked": 3,
+    "indistinguishable_from_winner": false,
+    "winner_equivalence_group_size": 2
+  },
+  "search": {
+    "regime": "streaming",
+    "method": "single_stage",
+    "search_space_size": 3,
+    "candidates_evaluated": 3,
+    "shortlist_size": null
+  },
+  "provenance": {
+    "timestamp_utc": "2026-08-30T10:37:51.181628+00:00",
+    "planner_git_sha": "29b3aee",
+    "simulator_git_sha": "e63fb4e181f4df2d361b3116328341cb9fc3d093",
+    "topology_id": "59d240e93a1350f9",
+    "seed": 0
+  }
+}

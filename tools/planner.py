@@ -285,7 +285,8 @@ def _run_scenario(topology_name: str, model_name: str, candidate_key: str,
     # 47's own §4 asks for: installing the patch must not, by itself,
     # change anything that keeps the original policy selected.
     install(topology.fabric, placement, d, reg, binding=binding, collective=True,
-           sglang_replica_scheduler=True)
+           sglang_replica_scheduler=True, qk_norm_allowlist_fix=True,
+           dense_model_moe_routing_guard=True)
 
     extra = seed_argv_fix(seed) if seeded else []
     tag = f"plan_{topology_name}_{candidate_key}_seed{seed}_seeded{int(seeded)}"

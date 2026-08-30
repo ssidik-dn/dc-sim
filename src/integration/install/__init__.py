@@ -56,12 +56,16 @@ from ..execution_time_predictor.mla_phase_filter import (
 from ..profiling.qk_norm_allowlist_fix import (
     install_qk_norm_allowlist_fix as _install_qk_norm_allowlist_fix,
 )
+from ..execution_time_predictor.dense_model_moe_routing_guard import (
+    install_dense_model_moe_routing_guard as _install_dense_model_moe_routing_guard,
+)
 
 
 def install(fabric: Fabric, placement: Placement, deployment: Deployment,
            groups: CommGroupRegistry, binding: Optional[BindingConfig] = None,
            collective: bool = False, sglang_replica_scheduler: bool = False,
-           mla_phase_filter: bool = False, qk_norm_allowlist_fix: bool = False) -> None:
+           mla_phase_filter: bool = False, qk_norm_allowlist_fix: bool = False,
+           dense_model_moe_routing_guard: bool = False) -> None:
     """Register every engine-backed Frontier extension, and make the engine
     state they need reachable. Safe to call more than once.
 
@@ -109,6 +113,22 @@ def install(fabric: Fabric, placement: Placement, deployment: Deployment,
     QK-norm compute during collection. `False` (the default) leaves
     `QK_NORM_MODEL_TYPE_ALLOWLIST` untouched, same as every task before
     this one.
+
+    `dense_model_moe_routing_guard` (Stage 2 Gate C.1) is optional and
+    defaults to `False`. `True` patches
+    `SklearnDisaggregationExecutionTimePredictor.__init__`
+    (`..execution_time_predictor.dense_model_moe_routing_guard`, guarded
+    by a source hash over the whole method) so a dense model
+    (`model_config.is_moe=False`) skips MoE expert-routing simulation
+    entirely instead of crashing on `total_expert_num=0`
+    (`ZeroDivisionError` in `_generate_expert_allocations`), while a
+    model whose metadata claims `is_moe=True` but declares
+    `total_expert_num<=0` fails loudly with an explicit
+    `InconsistentMoeModelMetadataError` instead. Every real MoE model
+    (`is_moe=True, total_expert_num>0`) is unaffected -- the original
+    routing computation runs unchanged. `False` (the default) leaves
+    `SklearnDisaggregationExecutionTimePredictor.__init__` untouched,
+    same as every task before this one.
     """
     _cc_backend.install()
     if collective:
@@ -117,6 +137,8 @@ def install(fabric: Fabric, placement: Placement, deployment: Deployment,
         _install_sglang_replica_scheduler_guard()
     if mla_phase_filter:
         _install_mla_phase_filter()
+    if dense_model_moe_routing_guard:
+        _install_dense_model_moe_routing_guard()
     if qk_norm_allowlist_fix:
         _install_qk_norm_allowlist_fix()
     _set_context(EngineContext(fabric, placement, deployment, groups, binding=binding,
